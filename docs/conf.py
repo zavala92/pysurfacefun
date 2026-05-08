@@ -29,8 +29,6 @@ html_title = "pysurfacefun"
 html_theme_options = {
     "description": "High-order solvers for surface PDEs",
     "fixed_sidebar": True,
-    "logo": "images/cow_complex_ginzburg_landau_real_u.png",
-    "logo_name": True,
     "page_width": "1180px",
     "sidebar_width": "320px",
     "show_powered_by": False,

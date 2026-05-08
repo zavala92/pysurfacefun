@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysurfacefun"
+version = "0.1.0"
+description = "High-order patch-based solvers for variable-coefficient elliptic PDEs on surfaces."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+authors = [{ name = "Gentian Zavalani" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib"]
+mat = ["scipy", "h5py"]
+io = ["meshio", "scipy", "h5py"]
+docs = ["sphinx"]
+dev = ["pytest", "matplotlib", "meshio", "scipy", "h5py"]
+
+[project.urls]
+Quadrilateral-reference = "https://github.com/danfortunato/surfacefun"
+Triangular-method-paper = "https://arxiv.org/pdf/2604.03097"
+
+[tool.setuptools.packages.find]
+include = ["pysurfacefun*"]

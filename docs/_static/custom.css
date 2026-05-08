@@ -1,0 +1,22 @@
+div.sphinxsidebar h1.logo {
+  margin: 18px 0 8px;
+  text-align: center;
+}
+
+div.sphinxsidebar p.logo {
+  margin: 0 0 16px;
+  text-align: center;
+}
+
+div.sphinxsidebar img.logo {
+  display: block;
+  width: 100%;
+  max-width: 285px;
+  height: auto;
+  margin: 0 auto;
+}
+
+div.sphinxsidebar p.blurb {
+  margin: 0 0 24px;
+  text-align: center;
+}

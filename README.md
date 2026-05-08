@@ -1,5 +1,9 @@
 # pysurfacefun
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-brightgreen.svg)](LICENSE)
+[![Documentation Status](https://readthedocs.org/projects/pysurfacefun/badge/?version=latest)](https://pysurfacefun.readthedocs.io/en/latest/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+
 High-order solvers for partial differential equations on smooth surfaces.
 
 `pysurfacefun` provides spectral patch discretizations, surface differential
@@ -84,6 +88,9 @@ Notebook examples are available in `notebooks/`. Generated figures, tables, and
 VTK files are written to `notebook_outputs/`.
 
 ## Documentation
+
+Online documentation:
+https://pysurfacefun.readthedocs.io/en/latest/
 
 The Sphinx documentation source is in `docs/`:
 

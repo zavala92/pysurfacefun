@@ -1,0 +1,89 @@
+body {
+  background: #f7fafc;
+}
+
+div.document {
+  box-shadow: none;
+}
+
+div.sphinxsidebar {
+  background: #2f86bd;
+  color: #ffffff;
+}
+
+div.sphinxsidebarwrapper {
+  display: flex;
+  flex-direction: column;
+  padding: 18px 22px 24px;
+}
+
+div.sphinxsidebar h1.logo {
+  order: 1;
+  margin: 0 0 12px;
+  text-align: center;
+  font-size: 30px;
+  font-weight: 700;
+}
+
+div.sphinxsidebar h1.logo a {
+  color: #ffffff;
+  text-decoration: none;
+}
+
+div.sphinxsidebar h1.logo a::before {
+  content: "⌂ ";
+  font-size: 0.9em;
+}
+
+div.sphinxsidebar p.logo {
+  order: 2;
+  margin: 0 auto 12px;
+  text-align: center;
+}
+
+div.sphinxsidebar img.logo {
+  width: 260px;
+  max-width: 92%;
+  border-radius: 4px;
+}
+
+div.sphinxsidebar p.blurb {
+  order: 3;
+  margin: 8px 0 22px;
+  color: #eef7ff;
+  text-align: center;
+  font-size: 16px;
+  line-height: 1.35;
+}
+
+div.sphinxsidebar #searchbox {
+  order: 4;
+}
+
+div.sphinxsidebar #searchbox h3,
+div.sphinxsidebar h3,
+div.sphinxsidebar h4 {
+  color: #ffffff;
+}
+
+div.sphinxsidebar input {
+  border: 1px solid rgba(255, 255, 255, 0.65);
+}
+
+div.sphinxsidebar a {
+  color: #ffffff;
+}
+
+div.sphinxsidebar a:hover {
+  color: #e7f4ff;
+}
+
+div.body h1,
+div.body h2,
+div.body h3 {
+  color: #184f78;
+}
+
+div.body {
+  color: #22313f;
+}

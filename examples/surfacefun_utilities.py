@@ -16,7 +16,7 @@ def main() -> None:
         print(f"n = {n:2d}, surface area = {area:.12f}, error = {abs(area - 4*math.pi):.3e}")
 
     dom = psf.sphere(n=7, nref=0)
-    f = psf.surfacefun(lambda x, y, z: x * y * z, dom)
+    f = psf.field(lambda x, y, z: x * y * z, dom)
 
     print(f"mean2(x*y*z)       = {psf.mean2(f): .3e}")
     print(f"norm_inf(x*y*z)    = {psf.norm(f, 'inf'):.6e}")

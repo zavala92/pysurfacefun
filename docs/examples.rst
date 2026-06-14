@@ -5,6 +5,13 @@ The examples below are implemented as Jupyter notebooks in ``notebooks/``. Each
 notebook writes visualization files to ``notebook_outputs/``. The images shown
 here correspond to the VTU files listed with each example.
 
+For repeatable runs, use ``pysurfacefun.Evaluator`` with JSONL, NPZ, and VTU
+handlers. This writes deterministic snapshot filenames and a ``manifest.json``
+describing the tasks and generated files.
+
+The script ``examples/evaluator_outputs.py`` is a compact template for this
+pattern.
+
 Triangular Laplace-Beltrami on the sphere
 -----------------------------------------
 

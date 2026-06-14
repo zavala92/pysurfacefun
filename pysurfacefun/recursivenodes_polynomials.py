@@ -126,15 +126,16 @@ def proriolkoornwinderdubiner(d: int, i: tuple[int, ...], x: Array, out: Array |
     """Evaluate one orthonormal PKD polynomial on the biunit simplex."""
     x = np.asarray(x)
     if d == 1:
-        return rn_jacobi(i[0], x[:, 0], out=out) / rn_jacobinorm2(i[0]) ** 0.5
+        pi = rn_jacobi(i[0], x[:, 0]) / rn_jacobinorm2(i[0]) ** 0.5
+        if out is not None:
+            out[...] = pi
+            return out
+        return pi
 
     isum = sum(i[: d - 1])
     factor = 1.0 - x[:, d - 1]
     nonzero = np.abs(factor) > 1.0e-10
-    if out is None:
-        px = np.empty(x[:, : d - 1].shape)
-    else:
-        px = out
+    px = np.empty(x[:, : d - 1].shape)
     px[nonzero, :] = ((x[nonzero, : d - 1] + 1.0) * 2.0 / factor[nonzero, np.newaxis] - 1.0)
     px[~nonzero, :] = -1.0
 
@@ -143,6 +144,9 @@ def proriolkoornwinderdubiner(d: int, i: tuple[int, ...], x: Array, out: Array |
     pi /= rn_jacobinorm2(i[-1], 2 * isum + d - 1, 0.0) ** 0.5
     pi *= factor**isum
     pi *= 2.0 ** ((d - 1) / 2)
+    if out is not None:
+        out[...] = pi
+        return out
     return pi
 
 

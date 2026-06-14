@@ -1420,6 +1420,50 @@ class TriangleSurfaceFunction:
 
 
 @dataclass
+class TriangleSurfaceVectorFunction:
+    """Three-component vector field sampled on a triangular surface mesh."""
+
+    components: tuple[TriangleSurfaceFunction, TriangleSurfaceFunction, TriangleSurfaceFunction]
+
+    @property
+    def domain(self) -> TriangleSurfaceMesh:
+        return self.components[0].domain
+
+    def norm_inf(self) -> float:
+        vals = zip(*(component.vals for component in self.components))
+        return float(max(np.max(np.sqrt(a * a + b * b + c * c)) for a, b, c in vals))
+
+    def __add__(self, other: float | Array | "TriangleSurfaceVectorFunction") -> "TriangleSurfaceVectorFunction":
+        if isinstance(other, TriangleSurfaceVectorFunction):
+            return TriangleSurfaceVectorFunction(tuple(a + b for a, b in zip(self.components, other.components)))
+        arr = np.asarray(other)
+        if arr.ndim == 0:
+            return TriangleSurfaceVectorFunction(tuple(a + float(arr) for a in self.components))
+        if arr.size == 3:
+            return TriangleSurfaceVectorFunction(tuple(a + arr[i] for i, a in enumerate(self.components)))
+        raise ValueError("can only add scalars, length-3 vectors, or TriangleSurfaceVectorFunction")
+
+    __radd__ = __add__
+
+    def __sub__(self, other: float | Array | "TriangleSurfaceVectorFunction") -> "TriangleSurfaceVectorFunction":
+        return self + (-other)
+
+    def __rsub__(self, other: float | Array) -> "TriangleSurfaceVectorFunction":
+        return (-self) + other
+
+    def __neg__(self) -> "TriangleSurfaceVectorFunction":
+        return TriangleSurfaceVectorFunction(tuple(-a for a in self.components))
+
+    def __mul__(self, other: float | TriangleSurfaceFunction) -> "TriangleSurfaceVectorFunction":
+        return TriangleSurfaceVectorFunction(tuple(a * other for a in self.components))
+
+    __rmul__ = __mul__
+
+    def __truediv__(self, other: float | TriangleSurfaceFunction) -> "TriangleSurfaceVectorFunction":
+        return TriangleSurfaceVectorFunction(tuple(a / other for a in self.components))
+
+
+@dataclass
 class TriangleLeaf(Patch):
     """Triangular leaf solution operator."""
 

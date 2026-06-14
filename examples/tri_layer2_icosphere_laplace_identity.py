@@ -20,14 +20,14 @@ def main() -> None:
     args = parser.parse_args()
 
     dom = psf.icosphere_tri(n=args.n, nref=args.nref)
-    u = psf.tri_surfacefun(lambda x, y, z: x * y * z, dom)
-    residual = psf.tri_lap(u) + 12 * u
+    u = psf.field(lambda x, y, z: x * y * z, dom)
+    residual = psf.lap(u) + 12 * u
 
     print(f"patches = {dom.npatches}")
     print(f"degree = {dom.degree}")
     print(f"nodes per patch = {dom.x[0].size}")
-    print(f"surface area = {psf.tri_surfacearea(dom):.12f}")
-    print(f"Delta_Gamma(xyz) + 12 xyz error = {residual.norm_inf():.3e}")
+    print(f"surface area = {psf.integral(psf.field(1.0, dom)):.12f}")
+    print(f"Delta_Gamma(xyz) + 12 xyz error = {psf.norm(residual, 'inf'):.3e}")
 
     if args.vtu:
         psf.write_tri_vtu(args.vtu, u)

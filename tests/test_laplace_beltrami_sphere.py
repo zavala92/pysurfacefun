@@ -1,4 +1,7 @@
+import numpy as np
+
 import pysurfacefun as psf
+from pysurfacefun.core import normalize_rows
 
 
 def test_laplace_beltrami_error_decreases_with_p():
@@ -17,6 +20,15 @@ def test_laplace_beltrami_error_decreases_with_p():
         errors.append(psf.norm(sol - exact.remove_mean(), "inf") / psf.norm(exact, "inf"))
 
     assert errors[2] < errors[1] < errors[0]
+
+
+def test_normalize_rows_handles_zero_rows():
+    rows = np.array([[3.0, 4.0, 0.0], [0.0, 0.0, 0.0], [1e-16, 0.0, 0.0]])
+    normalized = normalize_rows(rows)
+
+    assert np.all(np.isfinite(normalized))
+    assert np.allclose(normalized[0], [0.6, 0.8, 0.0])
+    assert np.allclose(normalized[1:], rows[1:])
 
 
 def test_surface_differentiation_identity_for_xyz():
@@ -44,6 +56,20 @@ def test_resample_preserves_low_order_function():
     assert abs(psf.norm(g, "inf") - psf.norm(f, "inf")) < 1e-12
 
 
+def test_unified_field_api_dispatches_quad_operations():
+    dom = psf.sphere(n=7, nref=0)
+    f = psf.field(lambda x, y, z: x * y * z, dom)
+    one = psf.field(1.0, dom)
+    g = psf.grad(f)
+    residual = psf.lap(f) + 12 * f
+
+    assert isinstance(f, psf.SurfaceFunction)
+    assert isinstance(g, psf.SurfaceVectorFunction)
+    assert abs(psf.integral(one) - psf.surfacearea(dom)) < 1e-12
+    assert psf.norm(residual, "inf") < 2e-2
+    assert psf.norm(g, 2) > 0.0
+
+
 def test_torus_geometry_area_stabilizes_with_p():
     area7 = psf.surfacearea(psf.torus(n=7, nu=2, nv=4))
     area9 = psf.surfacearea(psf.torus(n=9, nu=2, nv=4))
@@ -65,6 +91,20 @@ def test_torus_helmholtz_self_consistency():
     assert err < 5e-3
 
 
+def test_surface_lbvp_string_equation_solves_quad_helmholtz():
+    dom = psf.torus(n=9, nu=2, nv=4)
+    exact = psf.surfacefun(lambda x, y, z: x + y + z, dom)
+    alpha = 20.0
+    rhs = psf.lap(exact) + alpha * exact
+
+    problem = psf.SurfaceLBVP(dom, variables="u", namespace={"alpha": alpha, "rhs": rhs})
+    problem.add_equation("lap(u) + alpha*u = rhs")
+    sol = problem.build_solver().solve()
+
+    err = psf.norm(sol - exact, "inf") / psf.norm(exact, "inf")
+    assert err < 5e-3
+
+
 def test_torus_merge_tree_is_closed():
     dom = psf.torus(n=7, nu=2, nv=4)
     f = psf.surfacefun(lambda x, y, z: x + y + z, dom)
@@ -80,6 +120,15 @@ def test_stellarator_normal_is_unit_length():
     assert psf.norm(psf.vector_norm(vn) - 1, "inf") < 1e-12
 
 
+def test_vector_l2_norm_returns_scalar_integrated_norm():
+    dom = psf.sphere(n=7, nref=0)
+    radial = psf.vector_field(lambda x, y, z: x, lambda x, y, z: y, lambda x, y, z: z, dom)
+
+    assert isinstance(radial, psf.SurfaceVectorFunction)
+    assert isinstance(psf.norm(radial, 2), float)
+    assert abs(psf.norm(radial, 2) ** 2 - psf.surfacearea(dom)) < 1e-10
+
+
 def test_hodge_reconstruction_smoke():
     dom = psf.stellarator(n=5, nu=2, nv=4)
     x0 = y0 = z0 = 0.2
@@ -87,7 +136,7 @@ def test_hodge_reconstruction_smoke():
     def denom(x, y, z):
         return ((x - x0) ** 2 + (y - y0) ** 2 + (z - z0) ** 2) ** 1.5
 
-    G = psf.surfacefunv(
+    G = psf.vector_field(
         lambda x, y, z: (x - x0) / denom(x, y, z),
         lambda x, y, z: (y - y0) / denom(x, y, z),
         lambda x, y, z: (z - z0) / denom(x, y, z),

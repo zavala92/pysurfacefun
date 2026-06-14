@@ -3,8 +3,9 @@ pysurfacefun
 
 ``pysurfacefun`` provides high-order discretizations and fast direct solvers for
 partial differential equations on smooth surfaces. The package supports
-quadrilateral Chebyshev patches and triangular high-order patches, with
-notebook examples for convergence studies and time-dependent surface dynamics.
+quadrilateral Chebyshev patches and triangular high-order patches through one
+public field/operator interface, with notebook examples for convergence studies
+and time-dependent surface dynamics.
 
 .. toctree::
    :maxdepth: 2
@@ -20,7 +21,8 @@ Highlights
 ----------
 
 * High-order quadrilateral and triangular surface patches
-* Strong-form surface differential operators
-* Laplace-Beltrami, Helmholtz, and biharmonic examples
-* Reaction-diffusion examples on imported and implicit surfaces
+* Unified ``field``, ``lap``, ``grad``, ``integral``, and ``norm`` dispatch
+* ``SurfaceProblem`` and ``SurfaceLBVP`` for elliptic solves
+* ``SurfaceIVP`` for implicit reaction-diffusion stepping
+* Evaluator output handlers for repeatable examples and notebooks
 * VTU/VTP output for ParaView

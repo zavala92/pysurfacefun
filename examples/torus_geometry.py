@@ -16,7 +16,7 @@ def main() -> None:
         print(f"n = {n:2d}, patches = {dom.npatches:2d}, surface area = {psf.surfacearea(dom):.12f}")
 
     dom = psf.torus(n=9, nu=2, nv=4)
-    f = psf.surfacefun(lambda x, y, z: x + y + z, dom)
+    f = psf.field(lambda x, y, z: x + y + z, dom)
     print(f"mean2(x+y+z) = {psf.mean2(f): .6e}")
     print(f"norm_inf(x+y+z) = {psf.norm(f, 'inf'):.6e}")
 

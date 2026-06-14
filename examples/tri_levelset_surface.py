@@ -45,7 +45,7 @@ def main() -> None:
     grad_phi = lambda p: np.array([2.0 * p[0], 2.0 * p[1], 2.0 * p[2]])
 
     dom = psf.LevelSetSurface((vertices, faces), phi, grad_phi, n=9)
-    u = psf.tri_surfacefun(lambda x, y, z: x * y * z, dom)
+    u = psf.field(lambda x, y, z: x * y * z, dom)
 
     residual = max(
         np.max(np.abs(x * x + y * y + z * z - 1.0))
@@ -53,7 +53,7 @@ def main() -> None:
     )
     print(f"patches = {dom.npatches}")
     print(f"degree = {dom.degree}")
-    print(f"surface area = {psf.tri_surfacearea(dom):.12f}")
+    print(f"surface area = {psf.integral(psf.field(1.0, dom)):.12f}")
     print(f"max |phi| = {residual:.3e}")
 
     psf.write_tri_vtu("tri_levelset_sphere.vtu", u, point_name="u")

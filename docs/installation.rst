@@ -5,7 +5,7 @@ Install the package in editable mode from the Python package directory:
 
 .. code-block:: bash
 
-   cd python_surfacefun
+   cd pysurfacefun
    python -m pip install -e .
 
 For notebooks, plotting, tests, mesh import, and ParaView export:

@@ -54,17 +54,16 @@ def main() -> None:
 
     bb = psf.boundingbox(dom)
     u_random = psf.randnfun3(0.2, bb, seed=1)
-    u = psf.surfacefun(lambda x, y, z: u_random(x, y, z), dom)
+    u = psf.field(lambda x, y, z: u_random(x, y, z), dom)
 
-    print("Building reusable surface operators")
+    print("Building reusable implicit time-stepper")
     t0 = time.perf_counter()
-    L = psf.surfaceop(dom, {"lap": -dt * delta, "b": 1.0}, 0.0)
-    L.build()
+    solver = psf.SurfaceIVP(u, diffusion=delta, reaction=N).build_solver(dt).build()
     print(f"build time = {time.perf_counter() - t0:.2f} s")
 
     for k in range(1, args.steps + 1):
         step_t0 = time.perf_counter()
-        u = L.apply(u + dt * N(u))
+        u = solver.step()
         if args.print_every > 0 and (k == 1 or k == args.steps or k % args.print_every == 0):
             abs_u = abs(u)
             real_u = psf.real(u)

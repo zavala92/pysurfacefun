@@ -1,6 +1,7 @@
 import numpy as np
 
 import pysurfacefun as psf
+from pysurfacefun.recursivenodes_polynomials import proriolkoornwinderdubiner
 
 
 def test_recursive_triangle_nodes_match_reference_degree_four():
@@ -52,6 +53,18 @@ def test_recursive_pkd_basis_shapes_and_derivatives():
     assert np.max(np.abs(Dv_pkd @ f - fy)) < 2e-12
 
 
+def test_pkd_polynomial_out_parameter_receives_values():
+    x, y = psf.tri_reference_nodes(5)
+    xy_biunit = np.column_stack((2.0 * x - 1.0, 2.0 * y - 1.0))
+    expected = proriolkoornwinderdubiner(2, (1, 2), xy_biunit)
+    out = np.empty_like(expected)
+
+    result = proriolkoornwinderdubiner(2, (1, 2), xy_biunit, out=out)
+
+    assert result is out
+    assert np.max(np.abs(out - expected)) < 1e-14
+
+
 def test_triangular_icosphere_area_converges_with_p():
     exact = 4 * np.pi
     area5 = psf.tri_surfacearea(psf.icosphere_tri(n=5, nref=0))
@@ -72,6 +85,24 @@ def test_triangular_surface_laplacian_identity_improves_with_p():
     assert errors[2] < errors[1] < errors[0]
 
 
+def test_unified_field_api_dispatches_triangular_operations():
+    dom = psf.icosphere_tri(n=7, nref=1)
+    f = psf.field(lambda x, y, z: x * y * z, dom)
+    one = psf.field(1.0, dom)
+    g = psf.grad(f)
+    radial = psf.vector_field(lambda x, y, z: x, lambda x, y, z: y, lambda x, y, z: z, dom)
+
+    assert isinstance(f, psf.TriangleSurfaceFunction)
+    assert isinstance(g, psf.TriangleSurfaceVectorFunction)
+    assert isinstance(radial, psf.TriangleSurfaceVectorFunction)
+    assert all(isinstance(comp, psf.TriangleSurfaceFunction) for comp in g.components)
+    assert all(np.allclose(a, b) for a, b in zip(psf.lap(f).vals, psf.tri_lap(f).vals))
+    assert abs(psf.integral(one) - psf.tri_surfacearea(dom)) < 1e-12
+    assert psf.norm(f, "inf") == f.norm_inf()
+    assert psf.norm(g, 2) > 0.0
+    assert abs(psf.norm(radial, 2) ** 2 - psf.integral(one)) < 1e-12
+
+
 def test_triangular_surfaceop_helmholtz_improves_with_p():
     errors = []
     for n in (5, 7, 9):
@@ -83,6 +114,20 @@ def test_triangular_surfaceop_helmholtz_improves_with_p():
         errors.append((uh - exact).norm_inf() / exact.norm_inf())
 
     assert errors[2] < errors[1] < errors[0]
+
+
+def test_surface_problem_string_equation_solves_triangular_helmholtz():
+    dom = psf.icosphere_tri(n=9, nref=1)
+    exact = psf.tri_surfacefun(lambda x, y, z: x * y * z, dom)
+    alpha = 20.0
+    rhs = 8.0 * exact
+
+    problem = psf.SurfaceProblem(dom, variables="u", namespace={"alpha": alpha, "rhs": rhs})
+    problem.add_equation("lap(u) + alpha*u = rhs")
+    sol = problem.solve()
+
+    err = (sol - exact).norm_inf() / exact.norm_inf()
+    assert err < 5e-3
 
 
 def test_levelset_surface_tri_projects_nodes_to_sphere():

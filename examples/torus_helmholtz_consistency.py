@@ -10,13 +10,14 @@ import pysurfacefun as psf
 
 def solve_once(n: int) -> float:
     dom = psf.torus(n=n, nu=2, nv=4)
-    exact = psf.surfacefun(lambda x, y, z: x + y + z, dom)
+    exact = psf.field(lambda x, y, z: x + y + z, dom)
 
     alpha = 20.0
     rhs = psf.lap(exact) + alpha * exact
 
-    op = psf.surfaceop(dom, {"lap": 1.0, "c": alpha}, rhs)
-    numerical = op.solve()
+    problem = psf.SurfaceProblem(dom, variables="u", namespace={"alpha": alpha, "rhs": rhs})
+    problem.add_equation("lap(u) + alpha*u = rhs")
+    numerical = problem.solve()
 
     return psf.norm(numerical - exact, "inf") / psf.norm(exact, "inf")
 

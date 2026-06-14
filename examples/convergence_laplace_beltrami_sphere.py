@@ -12,15 +12,15 @@ import pysurfacefun as psf
 
 def solve_once(n: int, nref: int, l: int, m: int) -> float:
     dom = psf.sphere(n=n, nref=nref)
-    u_exact = psf.surfacefun(
+    u_exact = psf.field(
         lambda x, y, z: psf.real_spherical_harmonic(l, m, x, y, z),
         dom,
     )
     rhs = -l * (l + 1) * u_exact
 
-    L = psf.surfaceop(dom, {"lap": 1.0}, rhs)
-    L.rankdef = True
-    u_h = L.solve().remove_mean()
+    problem = psf.SurfaceProblem(dom, variables="u", namespace={"rhs": rhs})
+    problem.add_equation("lap(u) = rhs")
+    u_h = problem.build_solver(rankdef=True).solve().remove_mean()
 
     return psf.norm(u_h - u_exact.remove_mean(), "inf") / psf.norm(u_exact, "inf")
 

@@ -1087,7 +1087,7 @@ def norm(f: SurfaceFunction | SurfaceVectorFunction, p: int | float | str = 2, r
     if isinstance(f, SurfaceVectorFunction):
         mag = vector_norm(f)
         if p == 2 and reduce:
-            return mag
+            return float(np.sqrt(integral2(mag * mag)))
         return norm(mag, p, reduce)
 
     if p in (np.inf, "inf", "max"):
@@ -1693,6 +1693,7 @@ def binormals(dom: SurfaceMesh) -> tuple[Array, Array, Array, Array]:
 
 def normalize_rows(v: Array) -> Array:
     nrm = np.linalg.norm(v, axis=1, keepdims=True)
+    nrm = np.where(nrm > 1e-14, nrm, 1.0)
     return v / nrm
 
 

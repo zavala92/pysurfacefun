@@ -29,10 +29,10 @@ def main() -> None:
     exact_area = 4 * np.pi
     for n in parse_n_values(args.n_values):
         dom = psf.icosphere_tri(n=n, nref=args.nref)
-        u = psf.tri_surfacefun(lambda x, y, z: x * y * z, dom)
-        residual = psf.tri_lap(u) + 12 * u
-        area_error = abs(psf.tri_surfacearea(dom) - exact_area)
-        lap_error = residual.norm_inf()
+        u = psf.field(lambda x, y, z: x * y * z, dom)
+        residual = psf.lap(u) + 12 * u
+        area_error = abs(psf.integral(psf.field(1.0, dom)) - exact_area)
+        lap_error = psf.norm(residual, "inf")
         rows.append((dom.degree, n, dom.npatches, area_error, lap_error))
         print(
             f"degree={dom.degree:2d}, n={n:2d}, "

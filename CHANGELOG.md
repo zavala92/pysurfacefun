@@ -78,6 +78,10 @@
 - `parse_pdo` overwrote repeated terms (`{"lap": 1, "dxx": 2}`) instead of
   summing them.
 - `quadwts(n, kind=1)` returned uniform weights instead of Fejér weights.
+- `shifted_lobatto_nodes` (used by `family="lgl"` triangle nodes) failed with
+  NumPy 2.5, where `np.linalg.eigvals` returns complex arrays. The nodes are now
+  eigenvalues of the symmetric Jacobi matrix: real, exactly symmetric, and
+  more accurate at high degree.
 - The cow example defaulted to a machine-specific file path.
 
 ### Project
@@ -87,7 +91,7 @@
 - Added ruff configuration, a `py.typed` marker, and dynamic versioning
   (`pysurfacefun.__version__`).
 - Added benchmarks.
-- The test suite grew from 33 to 83 tests.
+- The test suite grew from 33 to 84 tests.
 - New documentation pages on the solver, equations, and time stepping.
 
 ## 0.1.0

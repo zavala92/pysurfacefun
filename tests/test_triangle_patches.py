@@ -28,6 +28,18 @@ def test_recursive_triangle_nodes_match_reference_degree_four():
     assert np.max(np.abs(nodes - expected)) < 5e-8
 
 
+def test_shifted_lobatto_nodes_are_real_symmetric_legendre_derivative_roots():
+    # NumPy >= 2.5 returns complex eigenvalues from eigvals, which made companion-matrix roots complex.
+    for degree in (2, 3, 4, 7, 16, 40, 80):
+        t = psf.shifted_lobatto_nodes(degree)
+        assert t.dtype == np.float64 and t.shape == (degree + 1,)
+        assert t[0] == 0.0 and t[-1] == 1.0 and np.all(np.diff(t) > 0)
+        assert np.max(np.abs(t + t[::-1] - 1.0)) < 1e-15
+        dP = np.polynomial.legendre.Legendre.basis(degree).deriv()
+        scale = degree * (degree + 1) / 2  # max |P'_n| on [-1, 1]
+        assert np.max(np.abs(dP(2 * t[1:-1] - 1))) < 1e-15 * degree**2 * scale
+
+
 def test_tri_strong_diffmat_exact_for_reference_polynomial():
     x, y = psf.tri_reference_nodes(6)
     Du, Dv, _ = psf.tri_strong_diffmat(5, x, y, basis="pkd")

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -47,10 +47,7 @@ def main() -> None:
     dom = psf.LevelSetSurface((vertices, faces), phi, grad_phi, n=9)
     u = psf.field(lambda x, y, z: x * y * z, dom)
 
-    residual = max(
-        np.max(np.abs(x * x + y * y + z * z - 1.0))
-        for x, y, z in zip(dom.x, dom.y, dom.z)
-    )
+    residual = max(np.max(np.abs(x * x + y * y + z * z - 1.0)) for x, y, z in zip(dom.x, dom.y, dom.z))
     print(f"patches = {dom.npatches}")
     print(f"degree = {dom.degree}")
     print(f"surface area = {psf.integral(psf.field(1.0, dom)):.12f}")

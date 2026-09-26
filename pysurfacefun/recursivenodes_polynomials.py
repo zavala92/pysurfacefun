@@ -12,7 +12,6 @@ from math import comb, lgamma
 
 import numpy as np
 
-
 Array = np.ndarray
 
 
@@ -27,7 +26,7 @@ def multiindex_equal(d: int, k: int):
         return
     for i in range(k):
         for alpha in multiindex_equal(d - 1, k - i):
-            yield (i,) + alpha
+            yield (i, *alpha)
     yield (k,) + (0,) * (d - 1)
 
 
@@ -46,9 +45,7 @@ def _jacobi_recurrence(n, alpha: float = 0.0, beta: float = 0.0) -> tuple[Array,
     a[n == 1] = (alpha + beta + 2) / 2
     b[n == 1] = (alpha - beta) / 2
     N = n[n > 1]
-    a[n > 1] = (2 * N + alpha + beta) * (2 * N + alpha + beta - 1) / (
-        2 * N * (N + alpha + beta)
-    )
+    a[n > 1] = (2 * N + alpha + beta) * (2 * N + alpha + beta - 1) / (2 * N * (N + alpha + beta))
     b[n > 1] = ((alpha * alpha - beta * beta) * (2 * N + alpha + beta - 1)) / (
         2 * N * (N + alpha + beta) * (2 * N + alpha + beta - 2)
     )
@@ -106,9 +103,7 @@ def rn_jacobider(
             out[:] = 0.0
             return out
         return np.zeros(np.shape(x))
-    return rn_jacobi(n - k, x, a + k, b + k) * np.exp(
-        lgamma(a + b + n + 1 + k) - lgamma(a + b + n + 1)
-    ) / 2**k
+    return rn_jacobi(n - k, x, a + k, b + k) * np.exp(lgamma(a + b + n + 1 + k) - lgamma(a + b + n + 1)) / 2**k
 
 
 def rn_jacobinorm2(n: int, a: float = 0.0, b: float = 0.0) -> float:
@@ -136,7 +131,7 @@ def proriolkoornwinderdubiner(d: int, i: tuple[int, ...], x: Array, out: Array |
     factor = 1.0 - x[:, d - 1]
     nonzero = np.abs(factor) > 1.0e-10
     px = np.empty(x[:, : d - 1].shape)
-    px[nonzero, :] = ((x[nonzero, : d - 1] + 1.0) * 2.0 / factor[nonzero, np.newaxis] - 1.0)
+    px[nonzero, :] = (x[nonzero, : d - 1] + 1.0) * 2.0 / factor[nonzero, np.newaxis] - 1.0
     px[~nonzero, :] = -1.0
 
     pi = proriolkoornwinderdubiner(d - 1, i[: d - 1], px)
@@ -173,21 +168,17 @@ def proriolkoornwinderdubinergrad(
     factor = 1.0 - x[:, d - 1]
     nonzero = np.abs(factor) > 1.0e-10
     px = np.empty(x[:, : d - 1].shape)
-    px[nonzero, :] = ((x[nonzero, : d - 1] + 1.0) * 2.0 / factor[nonzero, np.newaxis] - 1.0)
+    px[nonzero, :] = (x[nonzero, : d - 1] + 1.0) * 2.0 / factor[nonzero, np.newaxis] - 1.0
     px[~nonzero, :] = -1.0
 
-    pxgradfisum = np.zeros(px.shape + (d,))
+    pxgradfisum = np.zeros((*px.shape, d))
     for j in range(d - 1):
         pxgradfisum[nonzero, j, j] = 2.0 * factor[nonzero] ** (isum - 1)
-        pxgradfisum[nonzero, j, d - 1] = (
-            (x[nonzero, j] + 1.0) * 2.0 * factor[nonzero] ** (isum - 2)
-        )
+        pxgradfisum[nonzero, j, d - 1] = (x[nonzero, j] + 1.0) * 2.0 * factor[nonzero] ** (isum - 2)
         if isum > 0:
             pxgradfisum[~nonzero, j, j] = 2.0 * factor[~nonzero] ** (isum - 1)
         if isum > 1:
-            pxgradfisum[~nonzero, j, d - 1] = (
-                (x[~nonzero, j] + 1.0) * 2.0 * factor[~nonzero] ** (isum - 2)
-            )
+            pxgradfisum[~nonzero, j, d - 1] = (x[~nonzero, j] + 1.0) * 2.0 * factor[~nonzero] ** (isum - 2)
 
     pi, pigrad = proriolkoornwinderdubinergrad(d - 1, i[: d - 1], px, both=True)
     pz = rn_jacobi(i[-1], x[:, d - 1], 2 * isum + d - 1, 0.0)
@@ -216,16 +207,18 @@ def proriolkoornwinderdubinergrad(
     return pkdgrad
 
 
-def proriolkoornwinderdubinervandermonde(d: int, n: int, x: Array, out: Array | None = None, C: Array | None = None) -> Array:
+def proriolkoornwinderdubinervandermonde(
+    d: int, n: int, x: Array, out: Array | None = None, C: Array | None = None
+) -> Array:
     """Evaluate the PKD Vandermonde matrix on the biunit simplex."""
     x = np.asarray(x)
     N = npolys(d, n)
     if out is not None:
         V = out
     elif C is None:
-        V = np.empty(x.shape[:-1] + (N,))
+        V = np.empty((*x.shape[:-1], N))
     else:
-        V = np.empty(x.shape[:-1] + (C.shape[1],))
+        V = np.empty((*x.shape[:-1], C.shape[1]))
 
     if C is not None:
         V[:] = 0.0
@@ -253,20 +246,20 @@ def proriolkoornwinderdubinervandermondegrad(
     if out is not None:
         Vg = out
     elif C is None:
-        Vg = np.empty(x.shape[:-1] + (N, d))
+        Vg = np.empty((*x.shape[:-1], N, d))
     else:
-        Vg = np.empty(x.shape[:-1] + (C.shape[1], d))
+        Vg = np.empty((*x.shape[:-1], C.shape[1], d))
 
     if both:
         if C is None:
-            V = np.empty(x.shape[:-1] + (N,))
+            V = np.empty((*x.shape[:-1], N))
         else:
-            V = np.empty(x.shape[:-1] + (C.shape[1],))
+            V = np.empty((*x.shape[:-1], C.shape[1]))
         V[:] = 0.0
     Vg[:] = 0.0
 
     if work is None:
-        work = np.empty(x.shape[:-1] + (d,))
+        work = np.empty((*x.shape[:-1], d))
     for k, i in enumerate(multiindex_up_to(d, n)):
         if both:
             v, work = proriolkoornwinderdubinergrad(d, i, x, out=work, both=True)

@@ -8,9 +8,9 @@ matches the color pattern typically shown for this example.
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
-import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -21,12 +21,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--cow-file",
-        default="/Users/gentianzavalani/Downloads/cow.csv",
+        default=str(Path(__file__).resolve().parents[1] / "notebook_data" / "cow.csv"),
         help="Rhino CSV file with n*n rows per patch",
     )
     parser.add_argument("--rhino-n", type=int, default=8, help="points per patch in the CSV file")
     parser.add_argument("--solve-n", type=int, default=8, help="polynomial grid used for the solve")
-    parser.add_argument("--steps", type=int, default=2000, help="number of semi-implicit Euler steps")
+    parser.add_argument("--steps", type=int, default=2000, help="number of time steps")
+    parser.add_argument("--scheme", default="sbdf1", help=f"IMEX scheme ({', '.join(psf.SCHEMES)})")
     parser.add_argument("--print-every", type=int, default=10, help="print every this many steps")
     parser.add_argument("--plot", action="store_true", help="plot real(u) with Matplotlib at the end")
     parser.add_argument("--vtu", default="", help="optional VTU filename for real(u) at the end")
@@ -58,7 +59,7 @@ def main() -> None:
 
     print("Building reusable implicit time-stepper")
     t0 = time.perf_counter()
-    solver = psf.SurfaceIVP(u, diffusion=delta, reaction=N).build_solver(dt).build()
+    solver = psf.SurfaceIVP(u, diffusion=delta, reaction=N).build_solver(dt, scheme=args.scheme).build()
     print(f"build time = {time.perf_counter() - t0:.2f} s")
 
     for k in range(1, args.steps + 1):

@@ -1,6 +1,6 @@
 import json
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 import pysurfacefun as psf
 
@@ -67,9 +67,6 @@ def test_surface_ivp_run_writes_evaluator_diagnostics():
 
         solver.run(2, evaluator=evaluator, evaluate_initial=True)
 
-        rows = [
-            json.loads(line)
-            for line in (Path(tmp) / "scalars.jsonl").read_text(encoding="utf-8").splitlines()
-        ]
+        rows = [json.loads(line) for line in (Path(tmp) / "scalars.jsonl").read_text(encoding="utf-8").splitlines()]
         assert [row["iteration"] for row in rows] == [0, 1, 2]
         assert rows[-1]["time"] == solver.t

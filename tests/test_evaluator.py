@@ -1,6 +1,6 @@
 import json
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 import numpy as np
 
@@ -25,10 +25,7 @@ def test_evaluator_writes_jsonl_npz_and_manifest_for_quad_field():
         record0 = evaluator.evaluate(0, state={"u": u})
         record1 = evaluator.evaluate(1, state={"u": u})
 
-        scalar_lines = [
-            json.loads(line)
-            for line in (out / "scalars.jsonl").read_text(encoding="utf-8").splitlines()
-        ]
+        scalar_lines = [json.loads(line) for line in (out / "scalars.jsonl").read_text(encoding="utf-8").splitlines()]
         npz_path = out / "arrays" / "quad_u_000000.npz"
         skipped_npz_path = out / "arrays" / "quad_u_000001.npz"
         manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
@@ -51,10 +48,7 @@ def test_evaluator_writes_jsonl_npz_and_manifest_for_quad_field():
         rerun = psf.Evaluator(out, prefix="quad", handlers=[psf.JSONLinesOutputHandler()])
         rerun.add_task("mass", lambda state: psf.integral(state["u"]))
         rerun.evaluate(0, state={"u": u})
-        rerun_lines = [
-            json.loads(line)
-            for line in (out / "scalars.jsonl").read_text(encoding="utf-8").splitlines()
-        ]
+        rerun_lines = [json.loads(line) for line in (out / "scalars.jsonl").read_text(encoding="utf-8").splitlines()]
         assert len(rerun_lines) == 1
 
 

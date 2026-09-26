@@ -1,27 +1,61 @@
 """
 High-order fast direct solver for elliptic surface PDEs on quadrilateral Chebyshev patches.
 
-This module is a reduced Python version of the MATLAB Surfacefun package:
+This module is a Python version of the MATLAB Surfacefun package:
 https://github.com/danfortunato/surfacefun
 
 It provides geometry construction, strong-form surface differentiation, scalar
-surface functions, and direct patch-based solves for
+and vector surface functions, and fast direct solves of
 
-    lapcoef * Delta_Gamma u + ccoef * u = f.
+.. math::
 
-For pure Laplace-Beltrami problems on closed surfaces, set ``rankdef=True`` and
-use a mean-zero right-hand side.
+    \\sum_{c,d} a_{cd} D_c D_d u + \\sum_c b_c D_c u + b_0 u = f
+
+with constant or variable (real or complex) coefficients.  For the pure
+Laplace--Beltrami problem on a closed surface, set ``rankdef=True`` and use a
+mean-zero right-hand side.
+
+Storage
+-------
+A :class:`SurfaceMesh` with ``P`` patches of ``n x n`` Chebyshev points stores
+its coordinates and metric terms as contiguous ``(P, n, n)`` arrays, and a
+:class:`SurfaceFunction` stores its values as one ``(P, n, n)`` array
+(``field.data``).  The list-valued attributes of the original API (``dom.x``,
+``f.vals``, ...) are lists of views into that storage.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Callable, Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any
 
 import numpy as np
 
+from .fields import PatchField, PatchVectorField
+from .hps import Leaf, LeafOperators, Parent, Patch, merge_idx_from_tree, merge_patches, natural_tree
+from .operators import (
+    FIRST_ORDER_TERMS,
+    PDO,
+    SECOND_ORDER_TERMS,
+    HPSOperator,
+    coefficient_arrays,
+    evaluate_rhs_nodes,
+    parse_pdo,
+)
 
 Array = np.ndarray
+
+__all__ = [
+    "PDO",
+    "SurfaceFunction",
+    "SurfaceMesh",
+    "SurfaceOp",
+    "SurfaceVectorFunction",
+    "build_quad_leaves",
+    "parse_pdo",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +64,7 @@ Array = np.ndarray
 
 
 def chebpts(n: int, kind: int = 2, interval: tuple[float, float] = (-1.0, 1.0)) -> Array:
-    """Chebyshev points, ordered from left to right."""
+    """Chebyshev points of the first or second kind, ordered from left to right."""
     if n <= 0:
         return np.empty(0)
     if n == 1:
@@ -41,7 +75,6 @@ def chebpts(n: int, kind: int = 2, interval: tuple[float, float] = (-1.0, 1.0)) 
         x = np.polynomial.chebyshev.chebpts2(n)
     else:
         raise ValueError("kind must be 1 or 2")
-
     a, b = interval
     return 0.5 * ((b - a) * x + (a + b))
 
@@ -49,97 +82,81 @@ def chebpts(n: int, kind: int = 2, interval: tuple[float, float] = (-1.0, 1.0)) 
 def chebpts2(
     nx: int,
     ny: int | None = None,
-    D: Array | tuple[float, float, float, float] | None = None,
+    D: Array | tuple[float, float, float, float] | list[float] | None = None,
     kind: int = 2,
 ) -> tuple[Array, Array]:
-    """
-    Tensor-product Chebyshev grid.
-
-    The domain mapping is included here because the sphere constructor calls
-    ``chebpts2(n, n, [0, 1, 0, 1])``.
-    """
+    """Tensor-product Chebyshev grid ``(X, Y)`` on the rectangle ``D = [x0, x1, y0, y1]``."""
     if ny is None:
         ny = nx
-
     if D is None:
         D = np.array([-1.0, 1.0, -1.0, 1.0])
     else:
         D = np.array(D, dtype=float).flatten()
         if D.size != 4:
             raise ValueError("Unrecognized domain.")
-
     if kind is None:
         kind = 2
-
-    if kind == 2:
-        x = np.polynomial.chebyshev.chebpts2(nx)
-        y = np.polynomial.chebyshev.chebpts2(ny)
-    elif kind == 1:
-        x = np.polynomial.chebyshev.chebpts1(nx)
-        y = np.polynomial.chebyshev.chebpts1(ny)
-    else:
+    if kind not in (1, 2):
         raise ValueError("kind must be 1 or 2")
-
+    x = chebpts(nx, kind)
+    y = chebpts(ny, kind)
     x = 0.5 * ((D[1] - D[0]) * x + (D[0] + D[1]))
     y = 0.5 * ((D[3] - D[2]) * y + (D[2] + D[3]))
     return np.meshgrid(x, y)
 
 
-def diffmat(n: int) -> Array:
-    """Dense Chebyshev nodal differentiation matrix."""
-    x = chebpts(n, 2)
+@lru_cache(maxsize=64)
+def _diffmat_cached(n: int) -> Array:
     if n == 0:
         return np.empty((0, 0))
     if n == 1:
         return np.zeros((1, 1))
-
+    x = chebpts(n, 2)
     w = (-1.0) ** np.arange(n)
     w[0] *= 0.5
     w[-1] *= 0.5
-
-    D = np.zeros((n, n))
-    for i in range(n):
-        for j in range(n):
-            if i != j:
-                D[i, j] = w[j] / (w[i] * (x[i] - x[j]))
+    dx = x[:, None] - x[None, :]
+    np.fill_diagonal(dx, 1.0)
+    D = w[None, :] / (w[:, None] * dx)
+    np.fill_diagonal(D, 0.0)
     D[np.diag_indices(n)] = -np.sum(D, axis=1)
+    D.setflags(write=False)
     return D
 
 
+def diffmat(n: int) -> Array:
+    """Dense Chebyshev (second kind) nodal differentiation matrix."""
+    return _diffmat_cached(int(n)).copy()
+
+
 def barycentric_weights(x: Array) -> Array:
-    """Generic barycentric weights for the small Chebyshev grids used here."""
-    x = np.asarray(x, dtype=float)
-    w = np.ones_like(x)
-    for j in range(x.size):
-        diff = x[j] - np.delete(x, j)
-        w[j] = 1.0 / np.prod(diff)
-    return w
+    """Barycentric interpolation weights for the nodes ``x``."""
+    x = np.asarray(x, dtype=float).ravel()
+    diff = x[:, None] - x[None, :]
+    np.fill_diagonal(diff, 1.0)
+    return 1.0 / np.prod(diff, axis=1)
 
 
 def barymat(x_eval: Array, x_nodes: Array, weights: Array | None = None) -> Array:
-    """Barycentric interpolation matrix."""
+    """Barycentric interpolation matrix from ``x_nodes`` to ``x_eval``."""
     x_eval = np.asarray(x_eval, dtype=float).ravel()
     x_nodes = np.asarray(x_nodes, dtype=float).ravel()
     if weights is None:
         weights = barycentric_weights(x_nodes)
-
-    B = np.zeros((x_eval.size, x_nodes.size))
-    for i, x in enumerate(x_eval):
-        hit = np.where(np.isclose(x, x_nodes, rtol=0.0, atol=1e-14))[0]
-        if hit.size:
-            B[i, hit[0]] = 1.0
-        else:
-            tmp = weights / (x - x_nodes)
-            B[i, :] = tmp / np.sum(tmp)
+    diff = x_eval[:, None] - x_nodes[None, :]
+    hit = np.abs(diff) <= 1e-14
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tmp = weights[None, :] / diff
+        B = tmp / np.sum(tmp, axis=1, keepdims=True)
+    rows = np.flatnonzero(np.any(hit, axis=1))
+    if rows.size:
+        B[rows] = 0.0
+        B[rows, np.argmax(hit[rows], axis=1)] = 1.0
     return B
 
 
-def quadwts(n: int, kind: int = 2) -> Array:
-    """
-    Quadrature weights on Chebyshev nodes.
-
-    The second-kind formula is an FFT-based Clenshaw--Curtis routine.
-    """
+@lru_cache(maxsize=64)
+def _quadwts_cached(n: int, kind: int) -> Array:
     if n <= 0:
         return np.empty(0)
     if n == 1:
@@ -150,15 +167,31 @@ def quadwts(n: int, kind: int = 2) -> Array:
         w = np.real(np.fft.ifft(c))
         w[0] = w[0] / 2
         w = np.concatenate((w, [w[0]]), axis=0)
-        return w
-    return np.full(n, 2.0 / n)
+    else:
+        # Fejer's first rule on Chebyshev points of the first kind.
+        theta = (2 * np.arange(n) + 1) * np.pi / (2 * n)
+        k = np.arange(1, n // 2 + 1)
+        w = (2.0 / n) * (1.0 - 2.0 * np.sum(np.cos(2 * np.outer(theta, k)) / (4 * k**2 - 1), axis=1))
+        w = w[::-1]
+    w.setflags(write=False)
+    return w
+
+
+def quadwts(n: int, kind: int = 2) -> Array:
+    """Quadrature weights on ``n`` Chebyshev points of the given kind on ``[-1, 1]``.
+
+    Kind 2 uses the Clenshaw--Curtis rule and kind 1 Fejer's first rule.
+    """
+    return _quadwts_cached(int(n), int(kind)).copy()
 
 
 def rowscale(scale: Array, A: Array) -> Array:
+    """Multiply the rows of ``A`` by ``scale``."""
     return np.asarray(scale).reshape(-1, 1) * A
 
 
 def get_work_array(work: Array | None, shape: tuple[int, ...], dtype) -> Array:
+    """Zeroed work array, reusing ``work`` when shape and dtype match."""
     dtype = np.dtype(dtype)
     if work is None or work.shape != shape or work.dtype != dtype:
         return np.zeros(shape, dtype=dtype)
@@ -167,14 +200,14 @@ def get_work_array(work: Array | None, shape: tuple[int, ...], dtype) -> Array:
 
 
 def block_diag(blocks: Iterable[Array]) -> Array:
+    """Dense block-diagonal matrix."""
     blocks = [np.asarray(B) for B in blocks]
     if not blocks:
         return np.zeros((0, 0))
     nr = sum(B.shape[0] for B in blocks)
     nc = sum(B.shape[1] for B in blocks)
-    out = np.zeros((nr, nc))
-    r = 0
-    c = 0
+    out = np.zeros((nr, nc), dtype=np.result_type(*blocks))
+    r = c = 0
     for B in blocks:
         out[r : r + B.shape[0], c : c + B.shape[1]] = B
         r += B.shape[0]
@@ -183,104 +216,124 @@ def block_diag(blocks: Iterable[Array]) -> Array:
 
 
 # ---------------------------------------------------------------------------
-# surfacemesh.sphere and metric data.
+# Surface meshes.
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+def _stack_patches(values: Any, name: str) -> Array:
+    if isinstance(values, np.ndarray) and values.ndim == 3:
+        return np.ascontiguousarray(values, dtype=float)
+    arrays = [np.asarray(v, dtype=float) for v in values]
+    if not arrays:
+        raise ValueError(f"{name} must contain at least one patch")
+    shape = arrays[0].shape
+    if len(shape) != 2 or shape[0] != shape[1]:
+        raise ValueError(f"{name} patches must be square n x n arrays")
+    if any(a.shape != shape for a in arrays):
+        raise ValueError(f"all {name} patches must have the same shape")
+    return np.stack(arrays)
+
+
 class SurfaceMesh:
-    x: list[Array]
-    y: list[Array]
-    z: list[Array]
+    """Mesh of ``P`` tensor-product Chebyshev patches with ``n x n`` points each.
 
-    def __post_init__(self) -> None:
-        n = self.x[0].shape[0]
-        D = diffmat(n)
+    Parameters
+    ----------
+    x, y, z:
+        Patch coordinates: sequences of ``(n, n)`` arrays or ``(P, n, n)``
+        arrays.  Row index ``i`` follows the second parameter ``v`` and column
+        index ``j`` the first parameter ``u``.
 
-        self.xu: list[Array] = []
-        self.xv: list[Array] = []
-        self.yu: list[Array] = []
-        self.yv: list[Array] = []
-        self.zu: list[Array] = []
-        self.zv: list[Array] = []
+    Attributes
+    ----------
+    x, y, z, xu, xv, ..., ux, vx, ..., E, F, G, J:
+        Per-patch lists of views into contiguous ``(P, n, n)`` arrays:
+        coordinates, parametric derivatives, inverse-metric terms
+        (``ux = du/dx`` along the surface), first fundamental form, and its
+        determinant.  For patches flagged in ``singular`` the inverse-metric
+        terms are *not* divided by ``J`` and the solver scales the equations
+        accordingly.
+    """
 
-        self.ux: list[Array] = []
-        self.vx: list[Array] = []
-        self.uy: list[Array] = []
-        self.vy: list[Array] = []
-        self.uz: list[Array] = []
-        self.vz: list[Array] = []
+    def __init__(self, x: Any, y: Any, z: Any):
+        X = _stack_patches(x, "x")
+        Y = _stack_patches(y, "y")
+        Z = _stack_patches(z, "z")
+        if not (X.shape == Y.shape == Z.shape):
+            raise ValueError("x, y, z must have the same number and shape of patches")
+        self._X, self._Y, self._Z = X, Y, Z
+        n = X.shape[1]
+        D = _diffmat_cached(n)
 
-        self.E: list[Array] = []
-        self.F: list[Array] = []
-        self.G: list[Array] = []
-        self.J: list[Array] = []
-        self.singular: list[bool] = []
+        XU, XV = X @ D.T, np.matmul(D, X)
+        YU, YV = Y @ D.T, np.matmul(D, Y)
+        ZU, ZV = Z @ D.T, np.matmul(D, Z)
+        E = XU * XU + YU * YU + ZU * ZU
+        G = XV * XV + YV * YV + ZV * ZV
+        F = XU * XV + YU * YV + ZU * ZV
+        J = E * G - F * F
 
-        for x, y, z in zip(self.x, self.y, self.z):
-            xu = x @ D.T
-            xv = D @ x
-            yu = y @ D.T
-            yv = D @ y
-            zu = z @ D.T
-            zv = D @ z
+        num_ux = G * XU - F * XV
+        scl = np.max(np.abs(num_ux).reshape(X.shape[0], -1), axis=1)
+        singular = np.any((np.abs(J) < 1e-10 * np.maximum(scl, 1.0)[:, None, None]).reshape(X.shape[0], -1), axis=1)
+        regular = ~singular[:, None, None]
 
-            E = xu * xu + yu * yu + zu * zu
-            G = xv * xv + yv * yv + zv * zv
-            F = xu * xv + yu * yv + zu * zv
-            J = E * G - F * F
+        def inverse_metric(numerator: Array) -> Array:
+            out = numerator.copy()
+            np.divide(numerator, J, out=out, where=np.broadcast_to(regular, J.shape))
+            return out
 
-            scl = np.max(np.abs(G * xu - F * xv))
-            singular = bool(np.any(np.abs(J) < 1e-10 * max(scl, 1.0)))
+        self._XU, self._XV, self._YU, self._YV, self._ZU, self._ZV = XU, XV, YU, YV, ZU, ZV
+        self._UX = inverse_metric(num_ux)
+        self._UY = inverse_metric(G * YU - F * YV)
+        self._UZ = inverse_metric(G * ZU - F * ZV)
+        self._VX = inverse_metric(E * XV - F * XU)
+        self._VY = inverse_metric(E * YV - F * YU)
+        self._VZ = inverse_metric(E * ZV - F * ZU)
+        self._E, self._F, self._G, self._J = E, F, G, J
+        self._singular = singular
+        self._weights: Array | None = None
 
-            if singular:
-                ux = G * xu - F * xv
-                uy = G * yu - F * yv
-                uz = G * zu - F * zv
-                vx = E * xv - F * xu
-                vy = E * yv - F * yu
-                vz = E * zv - F * zu
-            else:
-                ux = (G * xu - F * xv) / J
-                uy = (G * yu - F * yv) / J
-                uz = (G * zu - F * zv) / J
-                vx = (E * xv - F * xu) / J
-                vy = (E * yv - F * yu) / J
-                vz = (E * zv - F * zu) / J
+        for name in ("x", "y", "z", "xu", "xv", "yu", "yv", "zu", "zv", "ux", "vx", "uy", "vy", "uz", "vz"):
+            setattr(self, name, list(getattr(self, "_" + name.upper())))
+        self.E, self.F, self.G, self.J = list(E), list(F), list(G), list(J)
+        self.singular = [bool(s) for s in singular]
 
-            self.xu.append(xu)
-            self.xv.append(xv)
-            self.yu.append(yu)
-            self.yv.append(yv)
-            self.zu.append(zu)
-            self.zv.append(zv)
-            self.ux.append(ux)
-            self.vx.append(vx)
-            self.uy.append(uy)
-            self.vy.append(vy)
-            self.uz.append(uz)
-            self.vz.append(vz)
-            self.E.append(E)
-            self.F.append(F)
-            self.G.append(G)
-            self.J.append(J)
-            self.singular.append(singular)
+    def __repr__(self) -> str:
+        return f"SurfaceMesh(npatches={self.npatches}, n={self.n})"
 
     @property
     def npatches(self) -> int:
-        return len(self.x)
+        """Number of patches."""
+        return int(self._X.shape[0])
 
     @property
     def n(self) -> int:
-        return self.x[0].shape[0]
+        """Chebyshev points per patch direction."""
+        return int(self._X.shape[1])
 
     @property
     def order(self) -> int:
+        """Polynomial degree per direction."""
         return self.n - 1
 
+    @property
+    def coords(self) -> Array:
+        """Coordinates as a ``(3, P, n, n)`` array."""
+        return np.stack((self._X, self._Y, self._Z))
+
+    @property
+    def quadrature_weights(self) -> Array:
+        """Clenshaw--Curtis weights times the surface Jacobian, shape ``(P, n, n)``."""
+        if self._weights is None:
+            w = _quadwts_cached(self.n, 2)
+            self._weights = np.outer(w, w)[None, :, :] * np.sqrt(np.maximum(self._J, 0.0))
+            self._weights.setflags(write=False)
+        return self._weights
+
     @staticmethod
-    def sphere(n: int, nref: int = 0, projection: str = "quasiuniform") -> "SurfaceMesh":
-        """Build a six-patch Chebyshev discretization of the unit sphere."""
+    def sphere(n: int, nref: int = 0, projection: str = "quasiuniform") -> SurfaceMesh:
+        """Six-patch cubed-sphere discretization of the unit sphere with ``4**nref`` patches per face."""
         v = np.array([[-1.0, 1.0, -1.0, 1.0]])
         for _ in range(nref):
             vnew = np.zeros((4 * v.shape[0], 4))
@@ -293,16 +346,8 @@ class SurfaceMesh:
             v = vnew
 
         xx0, yy0 = chebpts2(n, n, [0.0, 1.0, 0.0, 1.0])
-        uu = []
-        vv = []
-        for vk in v:
-            sclx = vk[1] - vk[0]
-            scly = vk[3] - vk[2]
-            uu.append(sclx * xx0 + vk[0])
-            vv.append(scly * yy0 + vk[2])
-        uu = np.stack(uu, axis=2)
-        vv = np.stack(vv, axis=2)
-
+        uu = np.stack([(vk[1] - vk[0]) * xx0 + vk[0] for vk in v], axis=2)
+        vv = np.stack([(vk[3] - vk[2]) * yy0 + vk[2] for vk in v], axis=2)
         ones = np.ones_like(uu)
         xx = np.concatenate((-ones, ones, vv, vv, uu, uu), axis=2)
         yy = np.concatenate((uu, uu, -ones, ones, vv, vv), axis=2)
@@ -314,24 +359,16 @@ class SurfaceMesh:
             xx, yy, zz = project_quasiuniform(xx, yy, zz)
         else:
             raise ValueError("projection must be 'naive' or 'quasiuniform'")
-
-        x = [xx[:, :, k] for k in range(xx.shape[2])]
-        y = [yy[:, :, k] for k in range(yy.shape[2])]
-        z = [zz[:, :, k] for k in range(zz.shape[2])]
-        return SurfaceMesh(x, y, z)
+        return SurfaceMesh(np.moveaxis(xx, 2, 0), np.moveaxis(yy, 2, 0), np.moveaxis(zz, 2, 0))
 
     @staticmethod
-    def torus(n: int, nu: int = 8, nv: int | None = None) -> "SurfaceMesh":
-        """Build a Fourier-parametrized torus patch mesh."""
+    def torus(n: int, nu: int = 8, nv: int | None = None) -> SurfaceMesh:
+        """Fourier-parametrized torus with ``nu x nv`` patches."""
         if nv is None:
             nv = nu
-
-        x: list[Array] = []
-        y: list[Array] = []
-        z: list[Array] = []
         ubreaks = np.linspace(0.0, 2.0 * np.pi, nu + 1)
         vbreaks = np.linspace(0.0, 2.0 * np.pi, nv + 1)
-
+        x, y, z = [], [], []
         for ku in range(nu):
             for kv in range(nv):
                 uu, vv = chebpts2(n, n, [ubreaks[ku], ubreaks[ku + 1], vbreaks[kv], vbreaks[kv + 1]])
@@ -339,21 +376,16 @@ class SurfaceMesh:
                 x.append(xx)
                 y.append(yy)
                 z.append(zz)
-
         return SurfaceMesh(x, y, z)
 
     @staticmethod
-    def stellarator(n: int, nu: int = 8, nv: int | None = None) -> "SurfaceMesh":
-        """Build a Fourier-parametrized stellarator patch mesh."""
+    def stellarator(n: int, nu: int = 8, nv: int | None = None) -> SurfaceMesh:
+        """Fourier-parametrized stellarator with ``nu x nv`` patches."""
         if nv is None:
             nv = nu
-
-        x: list[Array] = []
-        y: list[Array] = []
-        z: list[Array] = []
         ubreaks = np.linspace(0.0, 2.0 * np.pi, nu + 1)
         vbreaks = np.linspace(0.0, 2.0 * np.pi, nv + 1)
-
+        x, y, z = [], [], []
         for ku in range(nu):
             for kv in range(nv):
                 uu, vv = chebpts2(n, n, [ubreaks[ku], ubreaks[ku + 1], vbreaks[kv], vbreaks[kv + 1]])
@@ -361,48 +393,33 @@ class SurfaceMesh:
                 x.append(xx)
                 y.append(yy)
                 z.append(zz)
-
         if is_power_of_two(nv) and is_power_of_two(nu):
             ordering = morton(nv, nu).ravel(order="F") - 1
             x, y, z = reorder_cells_by_destination(ordering, x, y, z)
-
         return SurfaceMesh(x, y, z)
 
     @staticmethod
-    def from_rhino(filename: str, n: int) -> "SurfaceMesh":
-        """
-        Import a Rhino CSV patch mesh.
-
-        The file must have three numeric columns ``x,y,z`` and ``n*n``
-        consecutive rows per patch.
-        """
+    def from_rhino(filename: str, n: int) -> SurfaceMesh:
+        """Import a Rhino CSV patch mesh with columns ``x,y,z`` and ``n*n`` rows per patch."""
         data = np.loadtxt(filename, delimiter=",")
         if data.ndim != 2 or data.shape[1] < 3:
             raise ValueError("Rhino CSV must contain at least three numeric columns")
-
         rows_per_patch = n * n
         if data.shape[0] % rows_per_patch != 0:
-            raise ValueError(
-                f"row count {data.shape[0]} is not divisible by n*n={rows_per_patch}"
-            )
-
+            raise ValueError(f"row count {data.shape[0]} is not divisible by n*n={rows_per_patch}")
         nelem = data.shape[0] // rows_per_patch
-        X = data[:, 0].reshape((n, n * nelem), order="F")
-        Y = data[:, 1].reshape((n, n * nelem), order="F")
-        Z = data[:, 2].reshape((n, n * nelem), order="F")
-
-        x = [X[:, k * n : (k + 1) * n].copy() for k in range(nelem)]
-        y = [Y[:, k * n : (k + 1) * n].copy() for k in range(nelem)]
-        z = [Z[:, k * n : (k + 1) * n].copy() for k in range(nelem)]
-        return SurfaceMesh(x, y, z)
+        coords = [data[:, c].reshape((nelem, n, n)).transpose(0, 2, 1) for c in range(3)]
+        return SurfaceMesh(*coords)
 
 
 def project_naive(x: Array, y: Array, z: Array) -> tuple[Array, Array, Array]:
+    """Radial projection of cube points onto the unit sphere."""
     nrm = np.sqrt(x * x + y * y + z * z)
     return x / nrm, y / nrm, z / nrm
 
 
 def project_quasiuniform(x: Array, y: Array, z: Array) -> tuple[Array, Array, Array]:
+    """Equal-area-like projection of cube points onto the unit sphere."""
     xp = x * np.sqrt(1 - y * y / 2 - z * z / 2 + (y * y * z * z) / 3)
     yp = y * np.sqrt(1 - x * x / 2 - z * z / 2 + (x * x * z * z) / 3)
     zp = z * np.sqrt(1 - x * x / 2 - y * y / 2 + (x * x * y * y) / 3)
@@ -419,11 +436,9 @@ def eval_torus(u: Array, v: Array) -> tuple[Array, Array, Array]:
             [0.0, -0.25, -0.45, 0.0],
         ]
     )
-
     x = np.zeros_like(u)
     y = np.zeros_like(u)
     z = np.zeros_like(u)
-
     for i in range(-1, 3):
         for j in range(-1, 3):
             coeff = d[i + 1, j + 1]
@@ -431,7 +446,6 @@ def eval_torus(u: Array, v: Array) -> tuple[Array, Array, Array]:
             x = x + coeff * np.cos(v) * np.cos(phase)
             y = y + coeff * np.sin(v) * np.cos(phase)
             z = z + coeff * np.sin(phase)
-
     return x, y, z
 
 
@@ -451,21 +465,14 @@ def eval_stellarator(u: Array, v: Array) -> tuple[Array, Array, Array]:
             [0.01, -0.02, 0.02, 0.00, -0.02],
         ]
     )
-
     rz = np.zeros_like(u, dtype=complex)
     for j in range(-1, 5):
         for k in range(-1, 4):
             rz = rz + d[j + 1, k + 1] * np.exp(-1j * j * u + 1j * k * Q * v)
-
     rz = np.exp(1j * u) * rz
-    r1 = np.real(rz)
-    z1 = np.imag(rz)
-    r = r0 + R * (r1 - r0)
-    z = z0 + R * (z1 - z0)
-
-    x = r * np.cos(v)
-    y = r * np.sin(v)
-    return x, y, z
+    r = r0 + R * (np.real(rz) - r0)
+    z = z0 + R * (np.imag(rz) - z0)
+    return r * np.cos(v), r * np.sin(v), z
 
 
 def is_power_of_two(n: int) -> bool:
@@ -473,7 +480,7 @@ def is_power_of_two(n: int) -> bool:
 
 
 def morton(m: int, n: int | None = None) -> Array:
-    """Create the same Morton ordering matrix as ``tools/morton.m``."""
+    """Morton (Z-order) numbering matrix, as in Surfacefun's ``tools/morton.m``."""
     if n is None:
         n = m
     if m == 0 or n == 0:
@@ -491,7 +498,9 @@ def morton(m: int, n: int | None = None) -> Array:
     return np.block([[B, B + shift], [B + 2 * shift, B + 3 * shift]])
 
 
-def reorder_cells_by_destination(ordering: Array, x: list[Array], y: list[Array], z: list[Array]) -> tuple[list[Array], list[Array], list[Array]]:
+def reorder_cells_by_destination(
+    ordering: Array, x: list[Array], y: list[Array], z: list[Array]
+) -> tuple[list[Array], list[Array], list[Array]]:
     newx: list[Array | None] = [None] * len(x)
     newy: list[Array | None] = [None] * len(y)
     newz: list[Array | None] = [None] * len(z)
@@ -499,7 +508,7 @@ def reorder_cells_by_destination(ordering: Array, x: list[Array], y: list[Array]
         newx[int(dest)] = xx
         newy[int(dest)] = yy
         newz[int(dest)] = zz
-    return list(newx), list(newy), list(newz)
+    return list(newx), list(newy), list(newz)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -507,140 +516,43 @@ def reorder_cells_by_destination(ordering: Array, x: list[Array], y: list[Array]
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class SurfaceFunction:
-    domain: SurfaceMesh
-    vals: list[Array]
+class SurfaceFunction(PatchField):
+    """Scalar function sampled on the Chebyshev nodes of a :class:`SurfaceMesh`.
+
+    ``f.data`` holds the values as a ``(P, n, n)`` array; ``f.vals`` is the
+    list of per-patch views.  Fields support arithmetic with numbers, arrays,
+    and other fields on the same mesh, and NumPy ufuncs (``np.sin(f)``).
+    """
+
+    _family = "quad"
 
     @staticmethod
-    def from_callable(domain: SurfaceMesh, func: Callable[[Array, Array, Array], Array]) -> "SurfaceFunction":
-        vals = [np.asarray(func(x, y, z)) for x, y, z in zip(domain.x, domain.y, domain.z)]
-        return SurfaceFunction(domain, vals)
-
-    @staticmethod
-    def constant(domain: SurfaceMesh, value: float | complex) -> "SurfaceFunction":
-        return SurfaceFunction(domain, [value * np.ones_like(x) for x in domain.x])
+    def patch_shape(domain: SurfaceMesh) -> tuple[int, ...]:
+        return (domain.n, domain.n)
 
     def vec(self) -> Array:
+        """Values stacked column-major per patch (legacy layout)."""
         return np.column_stack([v.ravel(order="F") for v in self.vals]).ravel(order="F")
 
-    def norm_inf(self) -> float:
-        return float(max(np.max(np.abs(v)) for v in self.vals))
 
-    def mean2(self) -> float:
-        total = 0.0 + 0.0j
-        area = 0.0
-        wu = quadwts(self.domain.n, 2)
-        W = np.outer(wu, wu)
-        for v, J in zip(self.vals, self.domain.J):
-            jac = np.sqrt(np.maximum(J, 0.0))
-            total += np.sum(W * jac * v)
-            area += float(np.sum(W * jac))
-        out = total / area
-        return float(np.real(out)) if np.isrealobj(out) else out
+class SurfaceVectorFunction(PatchVectorField):
+    """Three-component vector field on a :class:`SurfaceMesh`."""
 
-    def remove_mean(self) -> "SurfaceFunction":
-        return self - self.mean2()
-
-    def copy(self) -> "SurfaceFunction":
-        return SurfaceFunction(self.domain, [v.copy() for v in self.vals])
-
-    def __add__(self, other: float | "SurfaceFunction") -> "SurfaceFunction":
-        if isinstance(other, SurfaceFunction):
-            return SurfaceFunction(self.domain, [a + b for a, b in zip(self.vals, other.vals)])
-        return SurfaceFunction(self.domain, [a + other for a in self.vals])
-
-    __radd__ = __add__
-
-    def __sub__(self, other: float | "SurfaceFunction") -> "SurfaceFunction":
-        if isinstance(other, SurfaceFunction):
-            return SurfaceFunction(self.domain, [a - b for a, b in zip(self.vals, other.vals)])
-        return SurfaceFunction(self.domain, [a - other for a in self.vals])
-
-    def __rsub__(self, other: float) -> "SurfaceFunction":
-        return SurfaceFunction(self.domain, [other - a for a in self.vals])
-
-    def __mul__(self, other: float | "SurfaceFunction") -> "SurfaceFunction":
-        if isinstance(other, SurfaceFunction):
-            return SurfaceFunction(self.domain, [a * b for a, b in zip(self.vals, other.vals)])
-        return SurfaceFunction(self.domain, [a * other for a in self.vals])
-
-    __rmul__ = __mul__
-
-    def __truediv__(self, other: float | "SurfaceFunction") -> "SurfaceFunction":
-        if isinstance(other, SurfaceFunction):
-            return SurfaceFunction(self.domain, [a / b for a, b in zip(self.vals, other.vals)])
-        return SurfaceFunction(self.domain, [a / other for a in self.vals])
-
-    def __rtruediv__(self, other: float) -> "SurfaceFunction":
-        return SurfaceFunction(self.domain, [other / a for a in self.vals])
-
-    def __pow__(self, power: float) -> "SurfaceFunction":
-        return SurfaceFunction(self.domain, [a**power for a in self.vals])
-
-    def __abs__(self) -> "SurfaceFunction":
-        return SurfaceFunction(self.domain, [np.abs(a) for a in self.vals])
-
-    def __neg__(self) -> "SurfaceFunction":
-        return SurfaceFunction(self.domain, [-a for a in self.vals])
-
-
-@dataclass
-class SurfaceVectorFunction:
-    """Three-component vector field sampled on a surface mesh."""
-
-    components: tuple[SurfaceFunction, SurfaceFunction, SurfaceFunction]
-
-    @property
-    def domain(self) -> SurfaceMesh:
-        return self.components[0].domain
-
-    def norm_inf(self) -> float:
-        vals = zip(*(component.vals for component in self.components))
-        return float(max(np.max(np.sqrt(a * a + b * b + c * c)) for a, b, c in vals))
-
-    def __add__(self, other: float | Array | "SurfaceVectorFunction") -> "SurfaceVectorFunction":
-        if isinstance(other, SurfaceVectorFunction):
-            return SurfaceVectorFunction(tuple(a + b for a, b in zip(self.components, other.components)))
-        arr = np.asarray(other)
-        if arr.ndim == 0:
-            return SurfaceVectorFunction(tuple(a + float(arr) for a in self.components))
-        if arr.size == 3:
-            return SurfaceVectorFunction(tuple(a + arr[i] for i, a in enumerate(self.components)))
-        raise ValueError("can only add scalars, length-3 vectors, or SurfaceVectorFunction")
-
-    __radd__ = __add__
-
-    def __sub__(self, other: float | Array | "SurfaceVectorFunction") -> "SurfaceVectorFunction":
-        return self + (-other)
-
-    def __rsub__(self, other: float | Array) -> "SurfaceVectorFunction":
-        return (-self) + other
-
-    def __neg__(self) -> "SurfaceVectorFunction":
-        return SurfaceVectorFunction(tuple(-a for a in self.components))
-
-    def __mul__(self, other: float | SurfaceFunction) -> "SurfaceVectorFunction":
-        return SurfaceVectorFunction(tuple(a * other for a in self.components))
-
-    __rmul__ = __mul__
-
-    def __truediv__(self, other: float | SurfaceFunction) -> "SurfaceVectorFunction":
-        return SurfaceVectorFunction(tuple(a / other for a in self.components))
+    _scalar_family = "quad"
 
 
 def sphere(n: int, nref: int = 0, projection: str = "quasiuniform") -> SurfaceMesh:
-    """Build a six-patch Chebyshev discretization of the unit sphere."""
+    """Six-patch cubed-sphere discretization of the unit sphere."""
     return SurfaceMesh.sphere(n, nref, projection)
 
 
 def torus(n: int, nu: int = 8, nv: int | None = None) -> SurfaceMesh:
-    """Build a Fourier-parametrized torus patch mesh."""
+    """Fourier-parametrized torus patch mesh."""
     return SurfaceMesh.torus(n, nu, nv)
 
 
 def stellarator(n: int, nu: int = 8, nv: int | None = None) -> SurfaceMesh:
-    """Build a Fourier-parametrized stellarator patch mesh."""
+    """Fourier-parametrized stellarator patch mesh."""
     return SurfaceMesh.stellarator(n, nu, nv)
 
 
@@ -650,181 +562,159 @@ def from_rhino(filename: str, n: int) -> SurfaceMesh:
 
 
 def surfacefun(func: Callable[[Array, Array, Array], Array] | float | list[Array], dom: SurfaceMesh) -> SurfaceFunction:
-    """Construct a scalar surface function on a ``SurfaceMesh``."""
+    """Scalar surface function from a callable ``f(x, y, z)``, a number, or per-patch values."""
     if callable(func):
         return SurfaceFunction.from_callable(dom, func)
     if np.isscalar(func):
-        return SurfaceFunction.constant(dom, func)
-    return SurfaceFunction(dom, [np.asarray(v) for v in func])
+        return SurfaceFunction.constant(dom, func)  # type: ignore[arg-type]
+    return SurfaceFunction(dom, func)
 
 
 def surfacefunv(
-    fx: Callable[[Array, Array, Array], Array] | SurfaceFunction | float | list[Array],
-    fy: Callable[[Array, Array, Array], Array] | SurfaceFunction | float | list[Array] | None = None,
-    fz: Callable[[Array, Array, Array], Array] | SurfaceFunction | float | list[Array] | None = None,
+    fx: Any,
+    fy: Any = None,
+    fz: Any = None,
     dom: SurfaceMesh | None = None,
 ) -> SurfaceVectorFunction:
-    """Construct a three-component vector surface function."""
+    """Three-component vector surface function."""
     if isinstance(fx, SurfaceMesh) and fy is None and fz is None:
         zero = surfacefun(0.0, fx)
         return SurfaceVectorFunction((zero, zero.copy(), zero.copy()))
-
     if isinstance(fx, SurfaceFunction) and isinstance(fy, SurfaceFunction) and isinstance(fz, SurfaceFunction):
         return SurfaceVectorFunction((fx, fy, fz))
-
     if dom is None:
         raise ValueError("dom is required when components are not SurfaceFunction objects")
-
-    assert fy is not None and fz is not None
+    if fy is None or fz is None:
+        raise ValueError("all three vector components are required")
     return SurfaceVectorFunction((surfacefun(fx, dom), surfacefun(fy, dom), surfacefun(fz, dom)))
 
 
-def surfaceop(dom: SurfaceMesh, op: dict, rhs: SurfaceFunction | Callable | float = 0.0) -> "SurfaceOp":
-    """Construct a scalar elliptic surface operator."""
-    return SurfaceOp(dom, op, rhs)
+def surfaceop(dom: SurfaceMesh, op: dict, rhs: Any = 0.0, **kwargs) -> SurfaceOp:
+    """Scalar elliptic surface operator with a fast direct solver."""
+    return SurfaceOp(dom, op, rhs, **kwargs)
 
 
-def compose(op: Callable, f: SurfaceFunction | float, g: SurfaceFunction | float | None = None) -> SurfaceFunction:
-    """
-    Compose a scalar function with one or two surface functions.
-    """
+def compose(op: Callable, f: Any, g: Any = None) -> Any:
+    """Apply a pointwise function to one or two surface functions."""
     if g is None:
-        if not isinstance(f, SurfaceFunction):
-            raise TypeError("single-argument compose expects a SurfaceFunction")
-        return SurfaceFunction(f.domain, [op(v) for v in f.vals])
+        if not isinstance(f, PatchField):
+            raise TypeError("single-argument compose expects a surface function")
+        return f._new(np.asarray(op(f.data)))
+    if isinstance(f, PatchField) and isinstance(g, PatchField):
+        return f._new(np.asarray(op(f.data, g.data)))
+    if isinstance(f, PatchField):
+        return f._new(np.asarray(op(f.data, g)))
+    if isinstance(g, PatchField):
+        return g._new(np.asarray(op(f, g.data)))
+    raise TypeError("at least one argument must be a surface function")
 
-    if isinstance(f, SurfaceFunction) and isinstance(g, SurfaceFunction):
-        return SurfaceFunction(f.domain, [op(a, b) for a, b in zip(f.vals, g.vals)])
-    if isinstance(f, SurfaceFunction):
-        return SurfaceFunction(f.domain, [op(a, g) for a in f.vals])
-    if isinstance(g, SurfaceFunction):
-        return SurfaceFunction(g.domain, [op(f, b) for b in g.vals])
-    raise TypeError("at least one argument must be a SurfaceFunction")
 
-
-def exp(f: SurfaceFunction) -> SurfaceFunction:
+def exp(f: Any) -> Any:
     return compose(np.exp, f)
 
 
-def log(f: SurfaceFunction) -> SurfaceFunction:
+def log(f: Any) -> Any:
     return compose(np.log, f)
 
 
-def log10(f: SurfaceFunction) -> SurfaceFunction:
+def log10(f: Any) -> Any:
     return compose(np.log10, f)
 
 
-def sqrt(f: SurfaceFunction) -> SurfaceFunction:
+def sqrt(f: Any) -> Any:
     return compose(np.sqrt, f)
 
 
-def sin(f: SurfaceFunction) -> SurfaceFunction:
+def sin(f: Any) -> Any:
     return compose(np.sin, f)
 
 
-def cos(f: SurfaceFunction) -> SurfaceFunction:
+def cos(f: Any) -> Any:
     return compose(np.cos, f)
 
 
-def real(f: SurfaceFunction) -> SurfaceFunction:
+def real(f: Any) -> Any:
     return compose(np.real, f)
 
 
-def imag(f: SurfaceFunction) -> SurfaceFunction:
+def imag(f: Any) -> Any:
     return compose(np.imag, f)
 
 
-def conj(f: SurfaceFunction) -> SurfaceFunction:
+def conj(f: Any) -> Any:
     return compose(np.conj, f)
 
 
-def maxEst(f: SurfaceFunction) -> float:
-    """Estimate the maximum sampled value."""
-    return float(max(np.max(v) for v in f.vals))
+def maxEst(f: Any) -> float:
+    """Largest sampled value."""
+    return float(np.max(f.data))
 
 
-def minEst(f: SurfaceFunction) -> float:
-    """Estimate the minimum sampled value."""
-    return float(min(np.min(v) for v in f.vals))
+def minEst(f: Any) -> float:
+    """Smallest sampled value."""
+    return float(np.min(f.data))
 
 
 def resample_mesh(dom: SurfaceMesh, n: int) -> SurfaceMesh:
-    """Resample every patch of a surface mesh to an ``n`` by ``n`` grid."""
-    m = dom.n
-    B = barymat(chebpts(n, 2), chebpts(m, 2))
-    x = [B @ patch @ B.T for patch in dom.x]
-    y = [B @ patch @ B.T for patch in dom.y]
-    z = [B @ patch @ B.T for patch in dom.z]
-    return SurfaceMesh(x, y, z)
+    """Resample every patch of a surface mesh to an ``n x n`` Chebyshev grid."""
+    B = barymat(chebpts(n, 2), chebpts(dom.n, 2))
+    return SurfaceMesh(*(np.matmul(B, np.matmul(C, B.T)) for C in (dom._X, dom._Y, dom._Z)))
 
 
 def resample(f: SurfaceFunction, n: int) -> SurfaceFunction:
-    """Resample a surface function to an ``n`` by ``n`` grid on each patch."""
-    m = f.domain.n
-    B = barymat(chebpts(n, 2), chebpts(m, 2))
-    vals = [B @ v @ B.T for v in f.vals]
-    return SurfaceFunction(resample_mesh(f.domain, n), vals)
+    """Resample a surface function to an ``n x n`` grid on each patch."""
+    B = barymat(chebpts(n, 2), chebpts(f.domain.n, 2))
+    return SurfaceFunction(resample_mesh(f.domain, n), np.matmul(B, np.matmul(f.data, B.T)))
 
 
 def prolong(f: SurfaceFunction, n: int | None = None) -> SurfaceFunction:
-    """
-    Prolong/restrict a surface function to a new polynomial grid.
-
-    This implementation uses barycentric patch interpolation, which is stable
-    for the smooth resolved functions used in the examples.
-    """
+    """Prolong or restrict a surface function to a new polynomial grid."""
     if n is None:
         return f.copy()
     return resample(f, n)
 
 
-def diff(f: SurfaceFunction, n: int | tuple[int, int, int] = 1, dim: int = 1) -> SurfaceFunction:
-    """
-    Differentiate a surface function in Cartesian surface directions.
+def _metric_pair(dom: SurfaceMesh, dim: int) -> tuple[Array, Array]:
+    if dim == 1:
+        return dom._UX, dom._VX
+    if dim == 2:
+        return dom._UY, dom._VY
+    if dim == 3:
+        return dom._UZ, dom._VZ
+    raise ValueError("dim must be 1, 2, or 3")
 
-    ``dim=1`` gives the tangential x derivative, ``dim=2`` gives y, and
-    ``dim=3`` gives z.  Passing ``n=(nx, ny, nz)`` applies mixed repeated
-    derivatives.
+
+def _diff_data(data: Array, dom: SurfaceMesh, dim: int) -> Array:
+    D = _diffmat_cached(dom.n)
+    du, dv = _metric_pair(dom, dim)
+    return du * (data @ D.T) + dv * np.matmul(D, data)
+
+
+def diff(f: SurfaceFunction, n: int | tuple[int, int, int] = 1, dim: int = 1) -> SurfaceFunction:
+    """Tangential Cartesian derivative of a surface function.
+
+    ``dim=1, 2, 3`` differentiates in ``x, y, z``.  ``n=(nx, ny, nz)`` applies
+    mixed repeated derivatives (``x`` first).
     """
     if isinstance(n, tuple):
         nx, ny, nz = n
-    elif dim == 1:
-        nx, ny, nz = int(n), 0, 0
-    elif dim == 2:
-        nx, ny, nz = 0, int(n), 0
-    elif dim == 3:
-        nx, ny, nz = 0, 0, int(n)
+    elif dim in (1, 2, 3):
+        counts = [0, 0, 0]
+        counts[dim - 1] = int(n)
+        nx, ny, nz = counts
     else:
         raise ValueError("dim must be 1, 2, or 3")
-
-    D = diffmat(f.domain.n)
-    vals = [v.copy() for v in f.vals]
-    out = SurfaceFunction(f.domain, vals)
-
-    for k in range(f.domain.npatches):
-        v = out.vals[k]
-        for _ in range(nx):
-            v = mapped_vdiff(v, f.domain, k, 1, D)
-        for _ in range(ny):
-            v = mapped_vdiff(v, f.domain, k, 2, D)
-        for _ in range(nz):
-            v = mapped_vdiff(v, f.domain, k, 3, D)
-        out.vals[k] = v
-    return out
+    data = f.data
+    for d, count in ((1, nx), (2, ny), (3, nz)):
+        for _ in range(count):
+            data = _diff_data(data, f.domain, d)
+    return SurfaceFunction(f.domain, data if data is not f.data else data.copy())
 
 
 def mapped_vdiff(vals: Array, dom: SurfaceMesh, k: int, dim: int, D: Array) -> Array:
-    dfdu = vals @ D.T
-    dfdv = D @ vals
-    if dim == 1:
-        du, dv = dom.ux[k], dom.vx[k]
-    elif dim == 2:
-        du, dv = dom.uy[k], dom.vy[k]
-    elif dim == 3:
-        du, dv = dom.uz[k], dom.vz[k]
-    else:
-        raise ValueError("dim must be 1, 2, or 3")
-    return du * dfdu + dv * dfdv
+    """Tangential derivative of one patch's values (legacy helper)."""
+    du, dv = _metric_pair(dom, dim)
+    return du[k] * (vals @ D.T) + dv[k] * (D @ vals)
 
 
 def diffx(f: SurfaceFunction, n: int = 1) -> SurfaceFunction:
@@ -840,7 +730,7 @@ def diffz(f: SurfaceFunction, n: int = 1) -> SurfaceFunction:
 
 
 def gradient(f: SurfaceFunction) -> SurfaceVectorFunction:
-    """Return the surface gradient as a three-component vector function."""
+    """Surface gradient as a three-component vector function."""
     return SurfaceVectorFunction((diffx(f), diffy(f), diffz(f)))
 
 
@@ -849,179 +739,181 @@ def grad(f: SurfaceFunction) -> SurfaceVectorFunction:
 
 
 def laplacian(f: SurfaceFunction) -> SurfaceFunction:
-    """Surface Laplacian."""
-    return diffx(f, 2) + diffy(f, 2) + diffz(f, 2)
+    """Laplace--Beltrami operator ``D_x D_x f + D_y D_y f + D_z D_z f``."""
+    dom = f.domain
+    out = _diff_data(_diff_data(f.data, dom, 1), dom, 1)
+    out += _diff_data(_diff_data(f.data, dom, 2), dom, 2)
+    out += _diff_data(_diff_data(f.data, dom, 3), dom, 3)
+    return SurfaceFunction(dom, out)
 
 
 def lap(f: SurfaceFunction) -> SurfaceFunction:
     return laplacian(f)
 
 
-def normal(dom: SurfaceMesh) -> SurfaceVectorFunction:
-    """Surface unit normal."""
-    nx: list[Array] = []
-    ny: list[Array] = []
-    nz: list[Array] = []
-    volume = 0.0
-    wu = quadwts(dom.n, 2)
-    W = np.outer(wu, wu)
+def _quad_edge_points(dom: SurfaceMesh) -> Array:
+    """Start point, end point, and mean point of the four edges of every patch, ``(P, 4, 3, 3)``."""
+    grid = np.stack((dom._X, dom._Y, dom._Z), axis=-1)
+    edges = (grid[:, :, 0], grid[:, :, -1], grid[:, 0, :], grid[:, -1, :])  # left, right, down, up
+    return np.stack([np.stack((e[:, 0], e[:, -1], e.mean(axis=1)), axis=1) for e in edges], axis=1)
 
-    for x, y, z, xu, xv, yu, yv, zu, zv, J in zip(
-        dom.x, dom.y, dom.z, dom.xu, dom.xv, dom.yu, dom.yv, dom.zu, dom.zv, dom.J
-    ):
-        n0 = yu * zv - zu * yv
-        n1 = zu * xv - xu * zv
-        n2 = xu * yv - yu * xv
-        scl = np.sqrt(n0 * n0 + n1 * n1 + n2 * n2)
-        n0 = n0 / scl
-        n1 = n1 / scl
-        n2 = n2 / scl
-        nx.append(n0)
-        ny.append(n1)
-        nz.append(n2)
-        volume += float(np.sum(((x * n0 + y * n1 + z * n2) / 3.0) * W * np.sqrt(np.maximum(J, 0.0))))
 
+#: Counterclockwise traversal sign of the stored left, right, down, up edges.
+QUAD_EDGE_CCW = np.array([-1, 1, 1, -1])
+
+
+def patch_orientation(dom: Any) -> Array:
+    """Per-patch signs (``+1``/``-1``) that orient all patch normals consistently."""
+    cached = getattr(dom, "_orientation", None)
+    if cached is None:
+        from .hps import edge_keys_from_points, orientation_signs
+
+        if isinstance(dom, SurfaceMesh):
+            points, ccw = _quad_edge_points(dom), QUAD_EDGE_CCW
+        else:
+            from .tri import TRI_EDGE_CCW, _tri_edge_points
+
+            points, ccw = _tri_edge_points(dom), TRI_EDGE_CCW
+        cached = orientation_signs(edge_keys_from_points(points), ccw)
+        dom._orientation = cached
+    return cached
+
+
+def _unit_normals(dom: Any) -> tuple[Array, Array, Array]:
+    """Unit normals oriented consistently and outward (positive enclosed volume)."""
+    n0 = dom._YU * dom._ZV - dom._ZU * dom._YV
+    n1 = dom._ZU * dom._XV - dom._XU * dom._ZV
+    n2 = dom._XU * dom._YV - dom._YU * dom._XV
+    signs = patch_orientation(dom).reshape((-1,) + (1,) * (n0.ndim - 1))
+    scl = np.sqrt(n0 * n0 + n1 * n1 + n2 * n2) * signs
+    n0, n1, n2 = n0 / scl, n1 / scl, n2 / scl
+    volume = float(np.sum((dom._X * n0 + dom._Y * n1 + dom._Z * n2) / 3.0 * dom.quadrature_weights))
     if volume < 0:
-        nx = [-v for v in nx]
-        ny = [-v for v in ny]
-        nz = [-v for v in nz]
-
-    return surfacefunv(nx, ny, nz, dom)
+        n0, n1, n2 = -n0, -n1, -n2
+    return n0, n1, n2
 
 
-def dot(f: SurfaceVectorFunction, g: SurfaceVectorFunction) -> SurfaceFunction:
-    fc = f.components
-    gc = g.components
+def normal(dom: Any) -> PatchVectorField:
+    """Unit normal, oriented consistently across patches and outward on closed surfaces."""
+    n0, n1, n2 = _unit_normals(dom)
+    if isinstance(dom, SurfaceMesh):
+        return SurfaceVectorFunction((SurfaceFunction(dom, n0), SurfaceFunction(dom, n1), SurfaceFunction(dom, n2)))
+    from .tri import TriangleSurfaceFunction, TriangleSurfaceVectorFunction
+
+    return TriangleSurfaceVectorFunction(
+        (TriangleSurfaceFunction(dom, n0), TriangleSurfaceFunction(dom, n1), TriangleSurfaceFunction(dom, n2))
+    )
+
+
+def dot(f: PatchVectorField, g: PatchVectorField) -> Any:
+    """Pointwise dot product of two vector fields."""
+    fc, gc = f.components, g.components
     return fc[0] * gc[0] + fc[1] * gc[1] + fc[2] * gc[2]
 
 
-def cross(f: SurfaceVectorFunction | Array | list[float], g: SurfaceVectorFunction | Array | list[float], *args) -> SurfaceVectorFunction:
-    """Vector cross product for arrays or surface vector functions."""
+def cross(f: Any, g: Any, *args) -> Any:
+    """Pointwise cross product of vector fields and/or constant 3-vectors."""
     if args:
         return cross(f, cross(g, *args))
-
-    f_is_vec = isinstance(f, SurfaceVectorFunction)
-    g_is_vec = isinstance(g, SurfaceVectorFunction)
-
+    f_is_vec = isinstance(f, PatchVectorField)
+    g_is_vec = isinstance(g, PatchVectorField)
     if f_is_vec and g_is_vec:
-        fc = f.components
-        gc = g.components
-        return surfacefunv(
-            fc[1] * gc[2] - fc[2] * gc[1],
-            fc[2] * gc[0] - fc[0] * gc[2],
-            fc[0] * gc[1] - fc[1] * gc[0],
-        )
-
+        fc, gc = f.components, g.components
+        return type(f)((fc[1] * gc[2] - fc[2] * gc[1], fc[2] * gc[0] - fc[0] * gc[2], fc[0] * gc[1] - fc[1] * gc[0]))
     if f_is_vec:
         arr = np.asarray(g, dtype=float).ravel()
         if arr.size != 3:
             raise ValueError("constant vector must have length 3")
         fc = f.components
-        return surfacefunv(
-            fc[1] * arr[2] - fc[2] * arr[1],
-            fc[2] * arr[0] - fc[0] * arr[2],
-            fc[0] * arr[1] - fc[1] * arr[0],
+        return type(f)(
+            (fc[1] * arr[2] - fc[2] * arr[1], fc[2] * arr[0] - fc[0] * arr[2], fc[0] * arr[1] - fc[1] * arr[0])
         )
-
     if g_is_vec:
         arr = np.asarray(f, dtype=float).ravel()
         if arr.size != 3:
             raise ValueError("constant vector must have length 3")
         gc = g.components
-        return surfacefunv(
-            arr[1] * gc[2] - arr[2] * gc[1],
-            arr[2] * gc[0] - arr[0] * gc[2],
-            arr[0] * gc[1] - arr[1] * gc[0],
+        return type(g)(
+            (arr[1] * gc[2] - arr[2] * gc[1], arr[2] * gc[0] - arr[0] * gc[2], arr[0] * gc[1] - arr[1] * gc[0])
         )
-
-    raise TypeError("at least one argument must be a SurfaceVectorFunction")
+    raise TypeError("at least one argument must be a vector surface function")
 
 
 def divergence(f: SurfaceVectorFunction) -> SurfaceFunction:
+    """Surface divergence of a vector field."""
     fc = f.components
-    return diffx(fc[0]) + diffy(fc[1]) + diffz(fc[2])
+    dom = fc[0].domain
+    out = _diff_data(fc[0].data, dom, 1) + _diff_data(fc[1].data, dom, 2) + _diff_data(fc[2].data, dom, 3)
+    return SurfaceFunction(dom, out)
 
 
 def div(f: SurfaceVectorFunction) -> SurfaceFunction:
     return divergence(f)
 
 
-def vector_norm(f: SurfaceVectorFunction) -> SurfaceFunction:
+def vector_norm(f: PatchVectorField) -> Any:
+    """Pointwise Euclidean length of a vector field."""
     fc = f.components
     return sqrt(fc[0] * fc[0] + fc[1] * fc[1] + fc[2] * fc[2])
 
 
-def normalize(f: SurfaceVectorFunction) -> SurfaceVectorFunction:
+def normalize(f: PatchVectorField) -> PatchVectorField:
+    """Unit vector field (zero vectors stay zero)."""
     mag = vector_norm(f)
-    safe = SurfaceFunction(
-        f.domain,
-        [np.where(np.abs(v) > 10 * np.finfo(float).eps, v, 1.0) for v in mag.vals],
-    )
+    safe = mag._new(np.where(np.abs(mag.data) > 10 * np.finfo(float).eps, mag.data, 1.0))
     return f / safe
 
 
-def hodge(f: SurfaceVectorFunction) -> tuple[SurfaceFunction, SurfaceFunction, SurfaceVectorFunction, SurfaceVectorFunction, SurfaceVectorFunction]:
-    """
-    Hodge decomposition of a vector surface function.
+def hodge(
+    f: SurfaceVectorFunction,
+) -> tuple[SurfaceFunction, SurfaceFunction, SurfaceVectorFunction, SurfaceVectorFunction, SurfaceVectorFunction]:
+    """Hodge decomposition of a tangential vector field.
 
-    Returns ``u, v, w, curlfree, divfree`` such that
-
-        f = grad(u) + normal x grad(v) + w.
+    Returns ``u, v, w, curlfree, divfree`` with
+    ``f = grad(u) + normal x grad(v) + w``.  Both scalar potentials reuse one
+    factorization of the Laplace--Beltrami operator.
     """
     dom = f.domain
     nvec = normal(dom)
-
-    L_u = SurfaceOp(dom, {"lap": 1.0}, div(f))
-    L_u.rankdef = True
-    u = L_u.solve().remove_mean()
-
-    L_v = SurfaceOp(dom, {"lap": 1.0}, -div(cross(nvec, f)))
-    L_v.rankdef = True
-    v = L_v.solve().remove_mean()
-
+    L = SurfaceOp(dom, {"lap": 1.0}, rankdef=True)
+    u = L.solve(div(f)).remove_mean()
+    v = L.solve(-div(cross(nvec, f))).remove_mean()
     curlfree = grad(u)
     divfree = cross(nvec, grad(v))
     w = f - curlfree - divfree
     return u, v, w, curlfree, divfree
 
 
-def integral2(f: SurfaceFunction, reduce: bool = True) -> float | Array:
-    """Surface integral of a scalar surface function."""
-    wu = quadwts(f.domain.n, 2)
-    W = np.outer(wu, wu)
-    dtype = np.result_type(*f.vals) if f.vals else float
-    per_patch = np.zeros(f.domain.npatches, dtype=dtype)
-    for k, (vals, J) in enumerate(zip(f.vals, f.domain.J)):
-        per_patch[k] = np.sum(vals * W * np.sqrt(np.maximum(J, 0.0)))
-    total = np.sum(per_patch)
-    return float(np.real(total)) if reduce and np.isrealobj(total) else total if reduce else per_patch
+def integral2(f: Any, reduce: bool = True) -> Any:
+    """Surface integral of a scalar surface function (per patch if ``reduce=False``)."""
+    return f.integral(reduce=reduce)
 
 
-def integral(f: SurfaceFunction, reduce: bool = True) -> float | Array:
+def integral(f: Any, reduce: bool = True) -> Any:
     return integral2(f, reduce)
 
 
-def sum2(f: SurfaceFunction, reduce: bool = True) -> float | Array:
+def sum2(f: Any, reduce: bool = True) -> Any:
     return integral2(f, reduce)
 
 
-def mean2(f: SurfaceFunction) -> float:
-    return integral2(f) / surfacearea(f.domain)
+def mean2(f: Any) -> Any:
+    """Surface average of a scalar function."""
+    return f.mean2()
 
 
-def surfacearea(dom: SurfaceMesh) -> float:
-    return integral2(SurfaceFunction.constant(dom, 1.0))
+def surfacearea(dom: Any) -> float:
+    """Total surface area."""
+    return float(np.sum(dom.quadrature_weights))
 
 
-def boundingbox(dom: SurfaceMesh) -> Array:
+def boundingbox(dom: Any) -> Array:
     """Bounding box ``[xmin, xmax, ymin, ymax, zmin, zmax]``."""
-    xmin = min(float(np.min(x)) for x in dom.x)
-    xmax = max(float(np.max(x)) for x in dom.x)
-    ymin = min(float(np.min(y)) for y in dom.y)
-    ymax = max(float(np.max(y)) for y in dom.y)
-    zmin = min(float(np.min(z)) for z in dom.z)
-    zmax = max(float(np.max(z)) for z in dom.z)
-    return np.array([xmin, xmax, ymin, ymax, zmin, zmax])
+    out = []
+    for coord in (dom.x, dom.y, dom.z):
+        arr = np.concatenate([np.ravel(c) for c in coord])
+        out.extend((float(np.min(arr)), float(np.max(arr))))
+    return np.array(out)
 
 
 def randnfun3(
@@ -1030,12 +922,9 @@ def randnfun3(
     seed: int | None = None,
     nmodes: int = 64,
 ) -> Callable[[Array, Array, Array], Array]:
-    """
-    Smooth deterministic 3D random field.
+    """Smooth random function on a 3D bounding box (random Fourier features).
 
-    This returns a finite smooth random Fourier field on the supplied physical
-    bounding box. It is meant for reproducible initial data in time-dependent
-    examples.
+    Returns a callable ``f(x, y, z)``; the same ``seed`` reproduces the field.
     """
     bbox = np.asarray(bbox, dtype=float).ravel()
     if bbox.size != 6:
@@ -1045,7 +934,6 @@ def randnfun3(
 
     rng = np.random.default_rng(seed)
     center = np.array([bbox[0] + bbox[1], bbox[2] + bbox[3], bbox[4] + bbox[5]]) / 2.0
-
     wavevectors = rng.normal(scale=1.0 / length_scale, size=(nmodes, 3))
     phases = rng.uniform(0.0, 2.0 * np.pi, size=nmodes)
     acos = rng.normal(size=nmodes) / np.sqrt(nmodes)
@@ -1073,524 +961,406 @@ def smooth_random_function_3d(
     seed: int | None = None,
     nmodes: int = 64,
 ) -> Callable[[Array, Array, Array], Array]:
-    """Descriptive alias for ``randnfun3``."""
+    """Descriptive alias for :func:`randnfun3`."""
     return randnfun3(length_scale, bbox, seed=seed, nmodes=nmodes)
 
 
-def norm(f: SurfaceFunction | SurfaceVectorFunction, p: int | float | str = 2, reduce: bool = True) -> float | Array | SurfaceFunction:
-    """
-    Surface function norms.
+def _gradient_components(f: Any) -> tuple[Any, Any, Any]:
+    if isinstance(f, SurfaceFunction):
+        return gradient(f).components
+    from .tri import tri_diff  # local import: tri depends on core
 
-    Supported: 1, 2, positive integer p, ``"inf"``, ``"max"``, ``"H1"``,
-    and ``"lap"``.
+    return tri_diff(f, 1), tri_diff(f, 2), tri_diff(f, 3)
+
+
+def _laplacian_any(f: Any) -> Any:
+    if isinstance(f, SurfaceFunction):
+        return laplacian(f)
+    from .tri import tri_lap
+
+    return tri_lap(f)
+
+
+def norm(f: Any, p: int | float | str = 2, reduce: bool = True) -> Any:
+    """Norm of a scalar or vector surface field.
+
+    Supported: ``1``, ``2``, any positive ``p``, ``"inf"``/``"max"``, ``"H1"``
+    (``L2`` norm of the field and its gradient) and ``"lap"`` (``L2`` norm of
+    the field and its Laplacian).  With ``reduce=False`` the per-patch
+    contributions are returned.
     """
-    if isinstance(f, SurfaceVectorFunction):
+    if isinstance(f, PatchVectorField):
         mag = vector_norm(f)
         if p == 2 and reduce:
-            return float(np.sqrt(integral2(mag * mag)))
+            return float(np.sqrt(np.real(integral2(mag * mag))))
         return norm(mag, p, reduce)
+    if not isinstance(f, PatchField):
+        raise TypeError("norm expects a scalar or vector surface field")
 
+    npatches = f.npatches
     if p in (np.inf, "inf", "max"):
-        per_patch = np.asarray([np.max(np.abs(v)) for v in f.vals])
+        per_patch = np.max(np.abs(f.data).reshape(npatches, -1), axis=1)
         return float(np.max(per_patch)) if reduce else per_patch
-
     if p == "H1":
-        g = gradient(f)
-        parts = [norm(f, 2, False)]
-        parts += [norm(comp, 2, False) for comp in g.components]
+        parts = [norm(f, 2, False)] + [norm(comp, 2, False) for comp in _gradient_components(f)]
         per_patch = np.sqrt(sum(part * part for part in parts))
         return float(np.sqrt(np.sum(per_patch * per_patch))) if reduce else per_patch
-
     if p == "lap":
         n0 = norm(f, 2, False)
-        n1 = norm(lap(f), 2, False)
+        n1 = norm(_laplacian_any(f), 2, False)
         per_patch = np.sqrt(n0 * n0 + n1 * n1)
         return float(np.sqrt(np.sum(per_patch * per_patch))) if reduce else per_patch
 
     p_float = float(p)
-    per_patch = np.zeros(f.domain.npatches)
-    for k, vals in enumerate(f.vals):
-        per_patch[k] = integral2(SurfaceFunction(f.domain, [np.abs(v) ** p_float if j == k else np.zeros_like(v) for j, v in enumerate(f.vals)]))
-    per_patch = per_patch ** (1.0 / p_float)
+    powered = f._new(np.abs(f.data) ** p_float)
+    per_patch = np.real(powered.integral(reduce=False)) ** (1.0 / p_float)
     if reduce:
-        return float(np.sum(per_patch ** p_float) ** (1.0 / p_float))
+        return float(np.sum(per_patch**p_float) ** (1.0 / p_float))
     return per_patch
 
 
 # ---------------------------------------------------------------------------
-# surfaceop subset: leaf operators, Schur complements, recursive solve.
+# Quadrilateral HPS leaves.
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class PDO:
-    dxx: float = 0.0
-    dyy: float = 0.0
-    dzz: float = 0.0
-    dxy: float = 0.0
-    dyx: float = 0.0
-    dyz: float = 0.0
-    dzy: float = 0.0
-    dxz: float = 0.0
-    dzx: float = 0.0
-    dx: float = 0.0
-    dy: float = 0.0
-    dz: float = 0.0
-    b: float = 0.0
+@dataclass(frozen=True)
+class _QuadReference:
+    """Reference data for ``n x n`` Chebyshev leaves (C-order node numbering)."""
+
+    n: int
+    D: Array
+    interior: Array
+    boundary: Array
+    S2L: Array
+    L2S: Array
+    wskel: Array
+    B: Array
+    Du_boundary: Array
+    Dv_boundary: Array
 
 
-def parse_pdo(op: dict) -> PDO:
-    out = PDO()
-    if "lap" in op:
-        out.dxx = op["lap"]
-        out.dyy = op["lap"]
-        out.dzz = op["lap"]
-    if "grad" in op:
-        out.dx = op["grad"]
-        out.dy = op["grad"]
-        out.dz = op["grad"]
-    for name in out.__dataclass_fields__:
-        if name in op:
-            setattr(out, name, op[name])
-    if "c" in op:
-        out.b = op["c"]
-    return out
-
-
-@dataclass
-class Patch:
-    domain: SurfaceMesh
-    ids: list[int]
-    S: Array
-    D2N: Array
-    D2N_scl: list[Array]
-    u_part: Array
-    du_part: Array
-    edges: Array
-    xyz: Array
-    w: Array
-
-    def solve(self, bc: Array | Callable | None = None) -> list[Array]:
-        raise NotImplementedError
-
-
-@dataclass
-class Leaf(Patch):
-    n: int = 0
-    Aii: Array | None = None
-    Aii_inv: Array | None = None
-    ii_flat: Array | None = None
-    normal_d: Array | None = None
-    _bc_work: Array | None = field(default=None, init=False, repr=False)
-
-    def solve(self, bc: Array | Callable | None = None) -> list[Array]:
-        if bc is None:
-            self._bc_work = get_work_array(self._bc_work, (self.S.shape[1], self.u_part.shape[1]), self.u_part.dtype)
-            bc_arr = self._bc_work
-        elif callable(bc):
-            vals = bc(self.xyz[:, 0], self.xyz[:, 1], self.xyz[:, 2])
-            bc_arr = np.asarray(vals).reshape(-1, 1)
-        else:
-            bc_arr = np.asarray(bc)
-            if bc_arr.ndim == 0:
-                bc_arr = np.full((self.S.shape[1], self.u_part.shape[1]), bc_arr.item())
-            elif bc_arr.ndim == 1:
-                bc_arr = bc_arr.reshape(-1, 1)
-
-        u = self.S @ bc_arr + self.u_part
-        return [u[:, j].reshape((self.n, self.n), order="F") for j in range(u.shape[1])]
-
-
-@dataclass
-class Parent(Patch):
-    child1: Patch | None = None
-    child2: Patch | None = None
-    idx1: tuple[Array, Array] | None = None
-    idx2: tuple[Array, Array] | None = None
-    flip1: Array | None = None
-    flip2: Array | None = None
-    scl1: Array | None = None
-    scl2: Array | None = None
-    A_inv: Array | None = None
-    M: Array | None = None
-    rankdef_merged: bool = False
-    _bc_work: Array | None = field(default=None, init=False, repr=False)
-    _bc1_work: Array | None = field(default=None, init=False, repr=False)
-    _bc2_work: Array | None = field(default=None, init=False, repr=False)
-
-    def solve(self, bc: Array | Callable | None = None) -> list[Array]:
-        nrhs = self.u_part.shape[1]
-        if bc is None:
-            self._bc_work = get_work_array(self._bc_work, (self.xyz.shape[0], nrhs), self.u_part.dtype)
-            bc_arr = self._bc_work
-        elif callable(bc):
-            vals = bc(self.xyz[:, 0], self.xyz[:, 1], self.xyz[:, 2])
-            bc_arr = np.asarray(vals).reshape(-1, 1)
-        else:
-            bc_arr = np.asarray(bc)
-            if bc_arr.ndim == 0:
-                bc_arr = np.full((self.xyz.shape[0], nrhs), bc_arr.item())
-            elif bc_arr.ndim == 1:
-                bc_arr = bc_arr.reshape(-1, 1)
-
-        u_interface = self.u_part.copy()
-        if self.S.size and bc_arr.size:
-            u_interface = u_interface + self.S @ bc_arr
-
-        assert self.child1 is not None and self.child2 is not None
-        assert self.idx1 is not None and self.idx2 is not None
-        assert self.flip1 is not None and self.flip2 is not None
-
-        ext1, glue1 = self.idx1
-        ext2, glue2 = self.idx2
-
-        bc_dtype = np.result_type(bc_arr, u_interface)
-        self._bc1_work = get_work_array(self._bc1_work, (self.child1.S.shape[1], nrhs), bc_dtype)
-        self._bc2_work = get_work_array(self._bc2_work, (self.child2.S.shape[1], nrhs), bc_dtype)
-        bc1 = self._bc1_work
-        bc2 = self._bc2_work
-
-        if ext1.size:
-            bc1[ext1, :] = bc_arr[: ext1.size, :]
-        if glue1.size:
-            bc1[glue1, :] = self.flip1.T @ u_interface
-
-        offset = ext1.size
-        if ext2.size:
-            bc2[ext2, :] = bc_arr[offset : offset + ext2.size, :]
-        if glue2.size:
-            bc2[glue2, :] = self.flip2.T @ u_interface
-
-        return self.child1.solve(bc1) + self.child2.solve(bc2)
-
-
-class SurfaceOp:
-    def __init__(self, domain: SurfaceMesh, op: dict, rhs: SurfaceFunction | Callable | float = 0.0):
-        self.domain = domain
-        self.op = parse_pdo(op)
-        self.rhs = rhs
-        self.rankdef = False
-        self.merge_idx = default_merge_idx(domain.npatches)
-        self._ii_flat = interior_mask_flat(domain.n)
-        self._num_int = int(np.sum(self._ii_flat))
-        self._rhs_work: Array | None = None
-        self.patches: list[Patch] = initialize_leaves(self.op, self.domain, self.rhs)
-        self._built = False
-
-    def build(self) -> None:
-        if self._built:
-            return
-        patches = self.patches
-        for level, idx in enumerate(self.merge_idx):
-            top = level == len(self.merge_idx) - 1
-            q: list[Patch] = []
-            for a_idx, b_idx in idx:
-                a = patches[a_idx]
-                b = None if b_idx is None else patches[b_idx]
-                if b is None:
-                    q.append(a)
-                else:
-                    q.append(merge_patches(a, b, rankdef=(self.rankdef and top)))
-            patches = q
-        self.patches = patches
-        self._built = True
-
-    def solve(self) -> SurfaceFunction:
-        self.build()
-        vals = self.patches[0].solve(None)
-        return SurfaceFunction(self.domain, vals)
-
-    def apply(self, rhs: SurfaceFunction | Callable | float) -> SurfaceFunction:
-        """Update the right-hand side and immediately solve."""
-        self.update_rhs(rhs)
-        return self.solve()
-
-    def update_rhs(self, rhs: SurfaceFunction | Callable | float) -> "SurfaceOp":
-        """
-        Update only the right-hand side data of an already assembled operator.
-
-        The geometry, local differential matrices, and Schur-complement
-        solution operators are reused.  Only the particular solution data are
-        recomputed and pushed up the merge tree.
-        """
-        if not self._built:
-            self.rhs = rhs
-            self.patches = initialize_leaves(self.op, self.domain, self.rhs)
-            return self
-
-        rhs_int = evaluate_rhs(rhs, self.domain, self._ii_flat, self._num_int, self._rhs_work)
-        self._rhs_work = rhs_int
-        for patch in self.patches:
-            update_patch_rhs(patch, rhs_int)
-        self.rhs = rhs
-        return self
-
-
-def default_merge_idx(npatches: int) -> list[list[tuple[int, int | None]]]:
-    """Binary merge schedule for patch-local solution operators."""
-    out: list[list[tuple[int, int | None]]] = []
-    np_now = npatches
-    ids: list[int | None] = list(range(npatches))
-    while np_now > 1:
-        if len(ids) % 2:
-            ids.append(None)
-        level = []
-        next_ids: list[int | None] = []
-        for k in range(0, len(ids), 2):
-            level.append((ids[k], ids[k + 1]))
-            next_ids.append(k // 2)
-        out.append(level)
-        ids = next_ids
-        np_now = len(ids)
-    return out
-
-
-def initialize_leaves(op: PDO, dom: SurfaceMesh, rhs: SurfaceFunction | Callable | float) -> list[Patch]:
-    n = dom.n
-    num_patches = dom.npatches
-
-    Xref, Yref = chebpts2(n)
-    ii = (np.abs(Xref) < 1.0) & (np.abs(Yref) < 1.0)
-    ee = ~ii
-    ii_flat = ii.ravel(order="F")
-    ee_flat = ee.ravel(order="F")
-    num_bdy = int(np.sum(ee_flat))
-    num_int = int(np.sum(ii_flat))
-
+@lru_cache(maxsize=16)
+def _quad_reference(n: int) -> _QuadReference:
     nskel = n - 2
-    num_skel = 4 * nskel
-    S2L = skel2leaf(n, nskel)
-    L2S = leaf2skel(nskel, n)
-    xskel = chebpts(nskel, 1)
-    xleaf = chebpts(n, 2)
-    B = barymat(xskel, xleaf)
-    wskel_1d = quadwts(nskel, 1).reshape(-1, 1)
-    wskel = np.vstack((wskel_1d, wskel_1d, wskel_1d, wskel_1d)).ravel()
-
-    left_skel = np.arange(0, nskel)
-    right_skel = np.arange(nskel, 2 * nskel)
-    down_skel = np.arange(2 * nskel, 3 * nskel)
-    up_skel = np.arange(3 * nskel, 4 * nskel)
-
-    NL, NR, ND, NU = binormals(dom)
-    NN_list = []
-    for k in range(num_patches):
-        NN_list.append(np.vstack((B @ NL[:, :, k], B @ NR[:, :, k], B @ ND[:, :, k], B @ NU[:, :, k])))
-
-    ux = stack_patch_vectors(dom.ux)
-    vx = stack_patch_vectors(dom.vx)
-    uy = stack_patch_vectors(dom.uy)
-    vy = stack_patch_vectors(dom.vy)
-    uz = stack_patch_vectors(dom.uz)
-    vz = stack_patch_vectors(dom.vz)
-
-    D = diffmat(n)
-    I = np.eye(n)
-    II = np.eye(n * n)
-    Du = np.kron(D, I)
-    Dv = np.kron(I, D)
-
-    rhs_int = evaluate_rhs(rhs, dom, ii_flat, num_int)
-
-    leaves: list[Patch] = []
-    tmpS_template = np.zeros((n * n, num_bdy + rhs_int.shape[1]), dtype=rhs_int.dtype)
-    tmpS_template[np.ix_(ee_flat, np.arange(num_bdy))] = np.eye(num_bdy)
-
-    for k in range(num_patches):
-        x = dom.x[k]
-        y = dom.y[k]
-        z = dom.z[k]
-
-        edges = np.array(
-            [
-                [x[0, 0], y[0, 0], z[0, 0], x[-1, 0], y[-1, 0], z[-1, 0], nskel],
-                [x[0, -1], y[0, -1], z[0, -1], x[-1, -1], y[-1, -1], z[-1, -1], nskel],
-                [x[0, 0], y[0, 0], z[0, 0], x[0, -1], y[0, -1], z[0, -1], nskel],
-                [x[-1, 0], y[-1, 0], z[-1, 0], x[-1, -1], y[-1, -1], z[-1, -1], nskel],
-            ],
-            dtype=float,
-        )
-
-        Dx = ux[:, [k]] * Du + vx[:, [k]] * Dv
-        Dy = uy[:, [k]] * Du + vy[:, [k]] * Dv
-        Dz = uz[:, [k]] * Du + vz[:, [k]] * Dv
-
-        A = np.zeros((n * n, n * n))
-        if op.dxx:
-            A += op.dxx * (Dx @ Dx)
-        if op.dyy:
-            A += op.dyy * (Dy @ Dy)
-        if op.dzz:
-            A += op.dzz * (Dz @ Dz)
-        if op.dxy:
-            A += op.dxy * (Dx @ Dy)
-        if op.dyx:
-            A += op.dyx * (Dy @ Dx)
-        if op.dyz:
-            A += op.dyz * (Dy @ Dz)
-        if op.dzy:
-            A += op.dzy * (Dz @ Dy)
-        if op.dxz:
-            A += op.dxz * (Dx @ Dz)
-        if op.dzx:
-            A += op.dzx * (Dz @ Dx)
-        if op.dx:
-            A += op.dx * Dx
-        if op.dy:
-            A += op.dy * Dy
-        if op.dz:
-            A += op.dz * Dz
-        if op.b:
-            A += op.b * II
-
-        Aii = A[np.ix_(ii_flat, ii_flat)]
-        Aie = A[np.ix_(ii_flat, ee_flat)]
-        rhs_k = rhs_int[:, :, k]
-        local_rhs = np.hstack((-Aie, rhs_k))
-        Aii_inv = inverse_dense(Aii)
-        S_int = solve_with_inverse(Aii_inv, local_rhs)
-
-        tmpS = tmpS_template.copy()
-        tmpS[ii_flat, :] = S_int
-        S = tmpS[:, :num_bdy] @ S2L
-        u_part = tmpS[:, num_bdy:]
-
-        dx = L2S @ Dx[ee_flat, :]
-        dy = L2S @ Dy[ee_flat, :]
-        dz = L2S @ Dz[ee_flat, :]
-
-        NN = NN_list[k]
-        normal_d = rowscale(NN[:, 0], dx) + rowscale(NN[:, 1], dy) + rowscale(NN[:, 2], dz)
-
-        D2N = normal_d @ S
-        du_part = normal_d @ u_part
-
-        D2N_scl = [
-            np.ones(nskel),
-            np.ones(nskel),
-            np.ones(nskel),
-            np.ones(nskel),
-        ]
-
-        J = dom.J[k].ravel(order="F")
-        xyz = L2S @ np.column_stack(
-            (
-                x.ravel(order="F")[ee_flat],
-                y.ravel(order="F")[ee_flat],
-                z.ravel(order="F")[ee_flat],
-            )
-        )
-        JJ = L2S @ np.sqrt(np.maximum(J[ee_flat], 0.0))
-        w = wskel * JJ
-
-        leaves.append(
-            Leaf(
-                domain=dom,
-                ids=[k],
-                S=S,
-                D2N=D2N,
-                D2N_scl=D2N_scl,
-                u_part=u_part,
-                du_part=du_part,
-                edges=edges,
-                xyz=xyz,
-                w=w,
-                n=n,
-                Aii=Aii,
-                Aii_inv=Aii_inv,
-                ii_flat=ii_flat,
-                normal_d=normal_d,
-            )
-        )
-
-    return leaves
+    Xref, Yref = chebpts2(n)
+    interior_f = (np.abs(Xref) < 1.0) & (np.abs(Yref) < 1.0)
+    boundary_f = np.flatnonzero(~interior_f.ravel(order="F"))
+    # Legacy (column-major) boundary sequence expressed in row-major node numbers.
+    boundary = (boundary_f % n) * n + boundary_f // n
+    idx = np.arange(1, n - 1)
+    interior = (idx[:, None] * n + idx[None, :]).ravel()
+    D = _diffmat_cached(n)
+    eye = np.eye(n)
+    return _QuadReference(
+        n=n,
+        D=D,
+        interior=interior,
+        boundary=boundary,
+        S2L=skel2leaf(n, nskel),
+        L2S=leaf2skel(nskel, n),
+        wskel=np.tile(quadwts(nskel, 1), 4),
+        B=barymat(chebpts(nskel, 1), chebpts(n, 2)),
+        Du_boundary=np.kron(eye, D)[boundary],
+        Dv_boundary=np.kron(D, eye)[boundary],
+    )
 
 
 def interior_mask_flat(n: int) -> Array:
-    """Interior-node mask in column-major patch order."""
+    """Interior-node mask in column-major patch order (legacy helper)."""
     Xref, Yref = chebpts2(n)
     return ((np.abs(Xref) < 1.0) & (np.abs(Yref) < 1.0)).ravel(order="F")
 
 
-def update_patch_rhs(patch: Patch, rhs_int: Array) -> None:
-    """Recursive right-hand-side update for the HPS merge tree."""
-    if isinstance(patch, Leaf):
-        patch_id = patch.ids[0]
-        rhs_k = rhs_int[:, :, patch_id]
-        assert patch.Aii_inv is not None and patch.ii_flat is not None and patch.normal_d is not None
-        ii_flat = patch.ii_flat
-        u_part = np.zeros((patch.n * patch.n, rhs_k.shape[1]), dtype=rhs_k.dtype)
-        u_part[ii_flat, :] = solve_with_inverse(patch.Aii_inv, rhs_k)
-        patch.u_part = u_part
-        patch.du_part = patch.normal_d @ patch.u_part
-        return
+def skel2leaf(nleaf: int, nskel: int) -> Array:
+    """Interpolation from the four edge skeletons to the leaf boundary nodes (corners averaged)."""
+    xskel = chebpts(nskel, 1)
+    xleaf = chebpts(nleaf, 2)
+    B = barymat(xleaf, xskel)
+    left_skel = np.arange(0, nskel)
+    right_skel = np.arange(nskel, 2 * nskel)
+    down_skel = np.arange(2 * nskel, 3 * nskel)
+    up_skel = np.arange(3 * nskel, 4 * nskel)
+    left_leaf = np.arange(0, nleaf)
+    right_leaf = np.arange(3 * nleaf - 4, 4 * nleaf - 4)
+    up_leaf = np.r_[np.arange(nleaf - 1, 3 * nleaf - 4, 2), 4 * nleaf - 5]
+    down_leaf = np.r_[0, np.arange(nleaf, 3 * nleaf - 3, 2)]
+    P = np.zeros((4 * nleaf - 4, 4 * nskel))
+    P[np.ix_(left_leaf, left_skel)] = B
+    P[np.ix_(right_leaf, right_skel)] = B
+    P[np.ix_(down_leaf, down_skel)] = B
+    P[np.ix_(up_leaf, up_skel)] = B
+    corners = np.array([0, nleaf - 1, 3 * nleaf - 4, 4 * nleaf - 5])
+    P[corners, :] *= 0.5
+    return P
 
-    if not isinstance(patch, Parent):
-        raise TypeError("unknown patch type")
 
-    assert patch.child1 is not None and patch.child2 is not None
-    assert patch.idx1 is not None and patch.idx2 is not None
-    assert patch.flip1 is not None and patch.flip2 is not None
-    assert patch.scl1 is not None and patch.scl2 is not None
-    assert patch.A_inv is not None and patch.M is not None
+def leaf2skel(nskel: int, nleaf: int) -> Array:
+    """Interpolation from the leaf boundary nodes to the four edge skeletons."""
+    xskel = chebpts(nskel, 1)
+    xleaf = chebpts(nleaf, 2)
+    B = barymat(xskel, xleaf)
+    left_skel = np.arange(0, nskel)
+    right_skel = np.arange(nskel, 2 * nskel)
+    down_skel = np.arange(2 * nskel, 3 * nskel)
+    up_skel = np.arange(3 * nskel, 4 * nskel)
+    left_leaf = np.arange(0, nleaf)
+    right_leaf = np.arange(3 * nleaf - 4, 4 * nleaf - 4)
+    up_leaf = np.r_[np.arange(nleaf - 1, 3 * nleaf - 4, 2), 4 * nleaf - 5]
+    down_leaf = np.r_[0, np.arange(nleaf, 3 * nleaf - 3, 2)]
+    P = np.zeros((4 * nskel, 4 * nleaf - 4))
+    P[np.ix_(left_skel, left_leaf)] = B
+    P[np.ix_(right_skel, right_leaf)] = B
+    P[np.ix_(down_skel, down_leaf)] = B
+    P[np.ix_(up_skel, up_leaf)] = B
+    return P
 
-    update_patch_rhs(patch.child1, rhs_int)
-    update_patch_rhs(patch.child2, rhs_int)
 
-    i1, s1 = patch.idx1
-    i2, s2 = patch.idx2
-    nrhs = patch.child1.u_part.shape[1]
+def normalize_rows(v: Array) -> Array:
+    """Normalize vectors along the last axis; (near-)zero vectors are left unchanged."""
+    nrm = np.linalg.norm(v, axis=-1, keepdims=True)
+    nrm = np.where(nrm > 1e-14, nrm, 1.0)
+    return v / nrm
 
-    if s1.size:
-        z_part = rowscale(patch.scl2, patch.flip1 @ patch.child1.du_part[s1, :]) + rowscale(
-            patch.scl1,
-            patch.flip2 @ patch.child2.du_part[s2, :],
-        )
-        patch.u_part = solve_with_inverse(patch.A_inv, z_part)
-    else:
-        patch.u_part = np.zeros((0, nrhs), dtype=patch.child1.u_part.dtype)
 
-    patch.du_part = (
-        np.vstack((patch.child1.du_part[i1, :], patch.child2.du_part[i2, :]))
-        + patch.M @ patch.u_part
+def _edge_conormals(dom: SurfaceMesh) -> Array:
+    """Unit outward conormals at the nodes of the four edges, shape ``(P, 4, n, 3)``."""
+    Xu = np.stack((dom._XU, dom._YU, dom._ZU), axis=-1)
+    Xv = np.stack((dom._XV, dom._YV, dom._ZV), axis=-1)
+    raw = np.stack((-Xu[:, :, 0], Xu[:, :, -1], -Xv[:, 0, :], Xv[:, -1, :]), axis=1)
+    tangent = normalize_rows(np.stack((Xv[:, :, 0], Xv[:, :, -1], Xu[:, 0, :], Xu[:, -1, :]), axis=1))
+    return normalize_rows(raw - tangent * np.sum(raw * tangent, axis=-1, keepdims=True))
+
+
+def binormals(dom: SurfaceMesh) -> tuple[Array, Array, Array, Array]:
+    """Edge conormals ``NL, NR, ND, NU`` with shape ``(n, 3, P)`` (legacy layout)."""
+    N = _edge_conormals(dom)
+    return tuple(np.moveaxis(N[:, e], 0, -1) for e in range(4))  # type: ignore[return-value]
+
+
+def _collect_coefficients(op: PDO, dom: Any, shape: tuple[int, ...]):
+    second: dict[tuple[int, int], Array] = {}
+    first: dict[int, Array] = {}
+    zeroth: Array | None = None
+    for name, value in op.nonzero().items():
+        arr = coefficient_arrays(value, dom, shape)
+        if name in SECOND_ORDER_TERMS:
+            second[SECOND_ORDER_TERMS[name]] = arr
+        elif name in FIRST_ORDER_TERMS:
+            first[FIRST_ORDER_TERMS[name]] = arr
+        else:
+            zeroth = arr
+    return second, first, zeroth
+
+
+def _singular_scaling(second, first, zeroth, U, V, J, dJdu, dJdv, singular):
+    """Multiply the equations on singular patches by ``J**3``.
+
+    With unnormalized metric terms ``D~_c = J D_c`` the scaled operator is
+    ``J a_cd D~_c D~_d + (J**2 b_d - a_cd D~_c J) D~_d + J**3 b0`` and the
+    right-hand side is multiplied by ``J**3``.  ``dJdu``/``dJdv`` are the
+    parametric derivatives of ``J``; other patches are left unchanged.
+    """
+    mask = singular.reshape((-1,) + (1,) * (J.ndim - 1))
+    sJ = np.where(mask, J, 1.0)
+    dJ = U * dJdu + V * dJdv
+    new_first: dict[int, Array] = {}
+    for d in range(3):
+        value = sJ**2 * first[d] if d in first else None
+        for c in range(3):
+            if (c, d) in second:
+                correction = np.where(mask, second[(c, d)] * dJ[c], 0.0)
+                value = -correction if value is None else value - correction
+        if value is not None:
+            new_first[d] = value
+    new_second = {key: sJ * value for key, value in second.items()}
+    new_zeroth = None if zeroth is None else sJ**3 * zeroth
+    return new_second, new_first, new_zeroth
+
+
+def build_quad_leaves(op: PDO | dict, dom: SurfaceMesh, max_chunk_bytes: float = 1.5e8) -> LeafOperators:
+    """Dense HPS leaf operators for every patch of a quadrilateral mesh.
+
+    The collocation operator on an ``n x n`` Chebyshev leaf is assembled from
+    the tensor-product structure ``D_u = I (x) D``, ``D_v = D (x) I``: every
+    term of ``D_c D_d`` has at most four nonzero index patterns, so only the
+    interior rows are formed, in ``O(n**4)`` work per patch instead of the
+    ``O(n**6)`` dense products.  Leaves are processed in batches.
+    """
+    op = parse_pdo(op)
+    n = dom.n
+    if n < 3:
+        raise ValueError("quadrilateral HPS leaves need at least n = 3 points per direction")
+    ref = _quad_reference(n)
+    P = dom.npatches
+    N = n * n
+    q = n - 2
+    m = q * q
+    nskel = n - 2
+    b = 4 * nskel
+    D = ref.D
+    DI = D[1:-1]
+    interior, boundary = ref.interior, ref.boundary
+    shape = (P, n, n)
+
+    second, first, zeroth = _collect_coefficients(op, dom, shape)
+    U = np.stack((dom._UX, dom._UY, dom._UZ))
+    V = np.stack((dom._VX, dom._VY, dom._VZ))
+    J = dom._J
+    singular = dom._singular
+    rhs_scale = None
+    flux_nodes = np.ones((P, N))
+    if np.any(singular):
+        second, first, zeroth = _singular_scaling(second, first, zeroth, U, V, J, J @ D.T, np.matmul(D, J), singular)
+        J3 = np.where(singular[:, None, None], J**3, 1.0).reshape(P, N)
+        rhs_scale = J3[:, interior]
+        flux_nodes = np.where(singular[:, None, None], J**2, 1.0).reshape(P, N)
+    dtype = np.result_type(float, *second.values(), *first.values(), *([] if zeroth is None else [zeroth]))
+
+    inner = (slice(None), slice(1, -1), slice(1, -1))
+    zeros_inner = np.zeros((P, q, q), dtype=dtype)
+
+    def combine(coeffs: dict, metric: Array, keys) -> Array:
+        """Sum of coeffs[key] * metric[axis] over (key, axis) pairs, on interior nodes."""
+        out = zeros_inner.copy()
+        for key, axis in keys:
+            if key in coeffs:
+                out = out + coeffs[key][inner] * metric[axis][inner]
+        return out
+
+    Pd = Qd = None
+    if second:
+        # Left multipliers of the D_u (Pd) and D_v (Qd) parts of D_c D_d, summed over c.
+        Pd = np.stack([combine(second, U, [((c, d), c) for c in range(3)]) for d in range(3)])
+        Qd = np.stack([combine(second, V, [((c, d), c) for c in range(3)]) for d in range(3)])
+    beta_u = combine(first, U, [(c, c) for c in range(3)]) if first else None
+    beta_v = combine(first, V, [(c, c) for c in range(3)]) if first else None
+    b0 = None if zeroth is None else zeroth[inner]
+
+    S_all = np.empty((P, N, b), dtype=dtype)
+    D2N_all = np.empty((P, b, b), dtype=dtype)
+    Ainv_all = np.empty((P, m, m), dtype=dtype)
+    G_all = np.empty((P, b, m), dtype=dtype)
+
+    # Conormals at skeleton points and the flux operator pieces.
+    NN = np.einsum("sn,pend->pesd", ref.B, _edge_conormals(dom)).reshape(P, b, 3)
+    U_ee = (U * flux_nodes.reshape(shape)[None]).reshape(3, P, N)[:, :, boundary]
+    V_ee = (V * flux_nodes.reshape(shape)[None]).reshape(3, P, N)[:, :, boundary]
+
+    itemsize = np.dtype(dtype).itemsize
+    per_patch = itemsize * (4 * q * q * n * n + 2 * m * m + 4 * N * b)
+    chunk = int(max(1, min(P, max_chunk_bytes // max(per_patch, 1))))
+    jj = np.arange(q)
+    for start in range(0, P, chunk):
+        stop = min(P, start + chunk)
+        sl = slice(start, stop)
+        c = stop - start
+        A4 = np.zeros((c, q, q, n, n), dtype=dtype)
+        T1 = np.zeros((c, q, q, n), dtype=dtype)
+        T4 = np.zeros((c, q, q, n), dtype=dtype)
+        if second:
+            assert Pd is not None and Qd is not None
+            PI, QI = Pd[:, sl], Qd[:, sl]
+            # Mixed D_u D_v and D_v D_u terms: A4[c,i,j,i',j'] = D[i,i'] X2[c,i,j,j'] + X3[c,i,j,i'] D[j,j'].
+            X2 = np.einsum("dcij,dcil->cijl", PI, V[:, sl, 1:-1, :]) * DI[None, None, :, :]
+            X3 = np.einsum("dcij,dckj->cijk", QI, U[:, sl, :, 1:-1]) * DI[None, :, None, :]
+            for a in range(q):  # one interior row index at a time keeps temporaries small
+                np.multiply(DI[a][None, None, :, None], X2[:, a][:, :, None, :], out=A4[:, a])
+                A4[:, a] += X3[:, a][:, :, :, None] * DI[None, :, None, :]
+            W_uu = np.einsum("dcij,dcik->cijk", PI, U[:, sl, 1:-1, :])
+            T1 += np.matmul(W_uu * DI[None, None, :, :], D)
+            W_vv = np.einsum("dcij,dckj->cijk", QI, V[:, sl, :, 1:-1])
+            T4 += np.matmul(W_vv * DI[None, :, None, :], D)
+        if beta_u is not None:
+            T1 += beta_u[sl][..., None] * DI[None, None, :, :]
+            T4 += beta_v[sl][..., None] * DI[None, :, None, :]
+        if b0 is not None:
+            T1[:, :, jj, jj + 1] += b0[sl]
+        for a in range(q):
+            A4[:, a, :, a + 1, :] += T1[:, a]
+            A4[:, :, a, :, a + 1] += T4[:, :, a]
+        Ainv = np.linalg.inv(A4[:, :, :, 1:-1, 1:-1].reshape(c, m, m))
+        Aie = A4.reshape(c, m, N)[:, :, boundary]
+        S = np.empty((c, N, b), dtype=dtype)
+        S[:, boundary, :] = ref.S2L
+        S[:, interior, :] = np.matmul(np.matmul(Ainv, -Aie), ref.S2L)
+
+        alpha = np.einsum("csk,kcp->csp", NN[sl], U_ee[:, sl]) * ref.L2S
+        beta = np.einsum("csk,kcp->csp", NN[sl], V_ee[:, sl]) * ref.L2S
+        normal_d = np.matmul(alpha, ref.Du_boundary) + np.matmul(beta, ref.Dv_boundary)
+        if rhs_scale is not None:
+            Ainv = Ainv * rhs_scale[sl][:, None, :]
+        S_all[sl] = S
+        D2N_all[sl] = np.matmul(normal_d, S)
+        Ainv_all[sl] = Ainv
+        G_all[sl] = np.matmul(normal_d[:, :, interior], Ainv)
+
+    coords = np.stack((dom._X, dom._Y, dom._Z), axis=-1).reshape(P, N, 3)
+    xyz = np.matmul(ref.L2S, coords[:, boundary, :])
+    sqrtJ = np.sqrt(np.maximum(J, 0.0)).reshape(P, N)[:, boundary]
+    w = ref.wskel * np.matmul(sqrtJ, ref.L2S.T)
+    scale = None
+    if np.any(singular):
+        J3_boundary = np.where(singular[:, None, None], J**3, 1.0).reshape(P, N)[:, boundary]
+        scale = np.matmul(J3_boundary, ref.L2S.T)
+
+    grid = np.stack((dom._X, dom._Y, dom._Z), axis=-1)
+    starts = np.stack((grid[:, 0, 0], grid[:, 0, -1], grid[:, 0, 0], grid[:, -1, 0]), axis=1)
+    ends = np.stack((grid[:, -1, 0], grid[:, -1, -1], grid[:, 0, -1], grid[:, -1, -1]), axis=1)
+    mids = xyz.reshape(P, 4, nskel, 3).mean(axis=2)
+    return LeafOperators(
+        S=S_all,
+        D2N=D2N_all,
+        Ainv=Ainv_all,
+        G=G_all,
+        interior=interior,
+        edge_sizes=np.full(4, nskel, dtype=np.int64),
+        edge_points=np.stack((starts, ends, mids), axis=2),
+        xyz=xyz,
+        w=w,
+        scale=scale,
+        centroids=coords.mean(axis=1),
     )
 
 
-def evaluate_rhs(
-    rhs: SurfaceFunction | Callable | float,
-    dom: SurfaceMesh,
-    ii_flat: Array,
-    num_int: int,
-    out: Array | None = None,
-) -> Array:
-    if isinstance(rhs, SurfaceFunction):
-        vals = [v.ravel(order="F")[ii_flat] for v in rhs.vals]
-        dtype = np.result_type(*vals) if vals else float
-        out = get_work_array(out, (num_int, 1, dom.npatches), dtype)
-        for k, v in enumerate(vals):
-            out[:, 0, k] = v
-        return out
+class SurfaceOp(HPSOperator):
+    """Fast direct solver for a scalar elliptic operator on a :class:`SurfaceMesh`.
 
-    if callable(rhs):
-        vals = []
-        for k in range(dom.npatches):
-            x = dom.x[k].ravel(order="F")[ii_flat]
-            y = dom.y[k].ravel(order="F")[ii_flat]
-            z = dom.z[k].ravel(order="F")[ii_flat]
-            vals.append(np.asarray(rhs(x, y, z)).ravel())
-        dtype = np.result_type(*vals) if vals else float
-        out = get_work_array(out, (num_int, 1, dom.npatches), dtype)
-        for k, v in enumerate(vals):
-            out[:, 0, k] = v
-        return out
+    Examples
+    --------
+    >>> dom = sphere(9, 1)
+    >>> f = surfacefun(lambda x, y, z: x * y * z, dom)
+    >>> L = SurfaceOp(dom, {"lap": 1.0, "c": 2.0}, (2.0 - 12.0) * f)
+    >>> u = L.solve()                       # factor + solve
+    >>> u2 = L.solve(3.0 * f)               # reuse the factorization
+    """
 
-    out = get_work_array(out, (num_int, 1, dom.npatches), np.asarray(rhs).dtype)
-    out.fill(rhs)
-    return out
+    def _build_leaf_operators(self) -> LeafOperators:
+        return build_quad_leaves(self.op, self.domain)
+
+    def _rhs_values(self, rhs: Any) -> Array:
+        n = self.domain.n
+        return evaluate_rhs_nodes(rhs, self.domain, _quad_reference(n).interior, n * n)
+
+    def _field_from_nodal(self, U: Array) -> SurfaceFunction:
+        n = self.domain.n
+        return SurfaceFunction(self.domain, U.reshape(self.domain.npatches, n, n))
+
+
+# ---------------------------------------------------------------------------
+# Legacy helpers kept for compatibility.
+# ---------------------------------------------------------------------------
+
+
+def default_merge_idx(npatches: int) -> list[list[tuple[int, int | None]]]:
+    """Merge schedule that pairs consecutive patch indices (the original ordering)."""
+    if npatches <= 1:
+        return []
+    return merge_idx_from_tree(natural_tree(npatches), npatches)
 
 
 def stack_patch_vectors(cells: list[Array]) -> Array:
-    return np.column_stack([a.ravel(order="F") for a in cells])
+    return np.column_stack([np.asarray(a).ravel(order="F") for a in cells])
 
 
 def solve_dense(A: Array, B: Array) -> Array:
@@ -1611,217 +1381,11 @@ def solve_with_inverse(A_inv: Array, B: Array) -> Array:
     return A_inv @ B
 
 
-def skel2leaf(nleaf: int, nskel: int) -> Array:
-    xskel = chebpts(nskel, 1)
-    xleaf = chebpts(nleaf, 2)
-    B = barymat(xleaf, xskel)
-
-    left_skel = np.arange(0, nskel)
-    right_skel = np.arange(nskel, 2 * nskel)
-    down_skel = np.arange(2 * nskel, 3 * nskel)
-    up_skel = np.arange(3 * nskel, 4 * nskel)
-
-    left_leaf = np.arange(0, nleaf)
-    right_leaf = np.arange(3 * nleaf - 4, 4 * nleaf - 4)
-    up_leaf = np.r_[np.arange(nleaf - 1, 3 * nleaf - 4, 2), 4 * nleaf - 5]
-    down_leaf = np.r_[0, np.arange(nleaf, 3 * nleaf - 3, 2)]
-
-    P = np.zeros((4 * nleaf - 4, 4 * nskel))
-    P[np.ix_(left_leaf, left_skel)] = B
-    P[np.ix_(right_leaf, right_skel)] = B
-    P[np.ix_(down_leaf, down_skel)] = B
-    P[np.ix_(up_leaf, up_skel)] = B
-
-    corners = np.array([0, nleaf - 1, 3 * nleaf - 4, 4 * nleaf - 5])
-    P[corners, :] *= 0.5
-    return P
-
-
-def leaf2skel(nskel: int, nleaf: int) -> Array:
-    xskel = chebpts(nskel, 1)
-    xleaf = chebpts(nleaf, 2)
-    B = barymat(xskel, xleaf)
-
-    left_skel = np.arange(0, nskel)
-    right_skel = np.arange(nskel, 2 * nskel)
-    down_skel = np.arange(2 * nskel, 3 * nskel)
-    up_skel = np.arange(3 * nskel, 4 * nskel)
-
-    left_leaf = np.arange(0, nleaf)
-    right_leaf = np.arange(3 * nleaf - 4, 4 * nleaf - 4)
-    up_leaf = np.r_[np.arange(nleaf - 1, 3 * nleaf - 4, 2), 4 * nleaf - 5]
-    down_leaf = np.r_[0, np.arange(nleaf, 3 * nleaf - 3, 2)]
-
-    P = np.zeros((4 * nskel, 4 * nleaf - 4))
-    P[np.ix_(left_skel, left_leaf)] = B
-    P[np.ix_(right_skel, right_leaf)] = B
-    P[np.ix_(down_skel, down_leaf)] = B
-    P[np.ix_(up_skel, up_leaf)] = B
-    return P
-
-
-def binormals(dom: SurfaceMesh) -> tuple[Array, Array, Array, Array]:
-    n = dom.n
-    P = dom.npatches
-    NL = np.zeros((n, 3, P))
-    NR = np.zeros((n, 3, P))
-    ND = np.zeros((n, 3, P))
-    NU = np.zeros((n, 3, P))
-
-    for k in range(P):
-        xu, xv = dom.xu[k], dom.xv[k]
-        yu, yv = dom.yu[k], dom.yv[k]
-        zu, zv = dom.zu[k], dom.zv[k]
-
-        nl = -np.column_stack((xu[:, 0], yu[:, 0], zu[:, 0]))
-        nr = np.column_stack((xu[:, -1], yu[:, -1], zu[:, -1]))
-        nd = -np.column_stack((xv[0, :], yv[0, :], zv[0, :]))
-        nu = np.column_stack((xv[-1, :], yv[-1, :], zv[-1, :]))
-
-        tl = normalize_rows(np.column_stack((xv[:, 0], yv[:, 0], zv[:, 0])))
-        tr = normalize_rows(np.column_stack((xv[:, -1], yv[:, -1], zv[:, -1])))
-        td = normalize_rows(np.column_stack((xu[0, :], yu[0, :], zu[0, :])))
-        tu = normalize_rows(np.column_stack((xu[-1, :], yu[-1, :], zu[-1, :])))
-
-        NL[:, :, k] = normalize_rows(nl - tl * np.sum(nl * tl, axis=1, keepdims=True))
-        NR[:, :, k] = normalize_rows(nr - tr * np.sum(nr * tr, axis=1, keepdims=True))
-        ND[:, :, k] = normalize_rows(nd - td * np.sum(nd * td, axis=1, keepdims=True))
-        NU[:, :, k] = normalize_rows(nu - tu * np.sum(nu * tu, axis=1, keepdims=True))
-
-    return NL, NR, ND, NU
-
-
-def normalize_rows(v: Array) -> Array:
-    nrm = np.linalg.norm(v, axis=1, keepdims=True)
-    nrm = np.where(nrm > 1e-14, nrm, 1.0)
-    return v / nrm
-
-
-def merge_patches(a: Patch, b: Patch, rankdef: bool = False) -> Patch:
-    i1, i2, s1, s2, flip1, flip2, scl1, scl2, sclAB, edgesAB = patch_intersect(a, b)
-
-    D2Na = a.D2N
-    D2Nb = b.D2N
-
-    A = -(
-        rowscale(scl2, flip1 @ D2Na[np.ix_(s1, s1)] @ flip1.T)
-        + rowscale(scl1, flip2 @ D2Nb[np.ix_(s2, s2)] @ flip2.T)
-    )
-    z = np.hstack(
-        (
-            rowscale(scl2, flip1 @ D2Na[np.ix_(s1, i1)]),
-            rowscale(scl1, flip2 @ D2Nb[np.ix_(s2, i2)]),
-        )
-    )
-    z_part = rowscale(scl2, flip1 @ a.du_part[s1, :]) + rowscale(scl1, flip2 @ b.du_part[s2, :])
-
-    if rankdef and i1.size == 0 and i2.size == 0 and A.size:
-        w = a.w[s1].reshape(-1, 1)
-        A = A + w @ w.T
-
-    A_inv = inverse_dense(A)
-    S = solve_with_inverse(A_inv, z)
-    u_part = solve_with_inverse(A_inv, z_part)
-
-    M = np.vstack((D2Na[np.ix_(i1, s1)] @ flip1.T, D2Nb[np.ix_(i2, s2)] @ flip2.T))
-    D2N = M @ S if S.size else np.zeros((i1.size + i2.size, i1.size + i2.size))
-
-    b1 = np.arange(i1.size)
-    b2 = np.arange(i2.size) + i1.size
-    if i1.size:
-        D2N[np.ix_(b1, b1)] += D2Na[np.ix_(i1, i1)]
-    if i2.size:
-        D2N[np.ix_(b2, b2)] += D2Nb[np.ix_(i2, i2)]
-
-    du_part = np.vstack((a.du_part[i1, :], b.du_part[i2, :])) + M @ u_part
-    xyz = np.vstack((a.xyz[i1, :], b.xyz[i2, :]))
-    w = np.concatenate((a.w[i1], b.w[i2]))
-
-    return Parent(
-        domain=a.domain,
-        ids=a.ids + b.ids,
-        S=S,
-        D2N=D2N,
-        D2N_scl=sclAB,
-        u_part=u_part,
-        du_part=du_part,
-        edges=edgesAB,
-        xyz=xyz,
-        w=w,
-        child1=a,
-        child2=b,
-        idx1=(i1, s1),
-        idx2=(i2, s2),
-        flip1=flip1,
-        flip2=flip2,
-        scl1=scl1,
-        scl2=scl2,
-        A_inv=A_inv,
-        M=M,
-        rankdef_merged=rankdef,
-    )
-
-
-def patch_intersect(a: Patch, b: Patch) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array, list[Array], Array]:
-    edgesA = a.edges.copy()
-    edgesB = b.edges.copy()
-
-    sclA = float(np.max(np.abs(edgesA[:, :6]))) if edgesA.size else 0.0
-    sclB = float(np.max(np.abs(edgesB[:, :6]))) if edgesB.size else 0.0
-    scl = max(sclA, sclB, 1.0)
-    tol = 1e-8 * scl
-
-    iA1, iB1 = intersect_tol(edgesA[:, :6], edgesB[:, :6], tol)
-    iA2, iB2 = intersect_tol(edgesA[:, [3, 4, 5, 0, 1, 2]], edgesB[:, :6], tol)
-
-    iA = np.concatenate((iA1, iA2)).astype(int)
-    iB = np.concatenate((iB1, iB2)).astype(int)
-
-    pA = edgesA[:, 6].astype(int)
-    pB = edgesB[:, 6].astype(int)
-    ppA = np.r_[0, np.cumsum(pA)]
-    ppB = np.r_[0, np.cumsum(pB)]
-
-    s1 = np.concatenate([np.arange(ppA[e], ppA[e + 1]) for e in iA]) if iA.size else np.empty(0, dtype=int)
-    s2 = np.concatenate([np.arange(ppB[e], ppB[e + 1]) for e in iB]) if iB.size else np.empty(0, dtype=int)
-
-    flip1 = np.eye(s1.size)
-    blocks = []
-    for e in iB1:
-        blocks.append(np.eye(pB[e]))
-    for e in iB2:
-        blocks.append(np.fliplr(np.eye(pB[e])))
-    flip2 = block_diag(blocks) if blocks else np.eye(s1.size)
-
-    allA = np.arange(int(np.sum(pA)))
-    allB = np.arange(int(np.sum(pB)))
-    i1 = np.setdiff1d(allA, s1, assume_unique=False)
-    i2 = np.setdiff1d(allB, s2, assume_unique=False)
-
-    scl1 = np.concatenate([a.D2N_scl[e] for e in iA]) if iA.size else np.empty(0)
-    scl2 = np.concatenate([b.D2N_scl[e] for e in iB]) if iB.size else np.empty(0)
-
-    sclA = list(a.D2N_scl)
-    sclB = list(b.D2N_scl)
-    for e in sorted(iA.tolist(), reverse=True):
-        del sclA[e]
-    for e in sorted(iB.tolist(), reverse=True):
-        del sclB[e]
-    sclAB = sclA + sclB
-
-    edgesA_remaining = np.delete(edgesA, iA, axis=0) if iA.size else edgesA
-    edgesB_remaining = np.delete(edgesB, iB, axis=0) if iB.size else edgesB
-    edgesAB = np.vstack((edgesA_remaining, edgesB_remaining))
-
-    return i1, i2, s1, s2, flip1, flip2, scl1, scl2, sclAB, edgesAB
-
-
 def intersect_tol(A: Array, B: Array, tol: float) -> tuple[Array, Array]:
-    AI = []
-    BI = []
+    """Rows of ``A`` matching a row of ``B`` within an L1 tolerance."""
+    AI, BI = [], []
     for k in range(A.shape[0]):
-        dist = np.sum(np.abs(B - A[k, :]), axis=1)
-        hit = np.where(dist < tol)[0]
+        hit = np.flatnonzero(np.sum(np.abs(B - A[k, :]), axis=1) < tol)
         if hit.size:
             AI.append(k)
             BI.append(int(hit[0]))
@@ -1834,25 +1398,24 @@ def intersect_tol(A: Array, B: Array, tol: float) -> tuple[Array, Array]:
 
 
 def associated_legendre(l: int, m: int, x: Array) -> Array:
-    """Associated Legendre P_l^m(x), unnormalized, for m >= 0."""
+    """Associated Legendre function ``P_l^m(x)`` (unnormalized, Condon--Shortley phase), ``m >= 0``."""
     if m < 0 or m > l:
         raise ValueError("require 0 <= m <= l")
-    x = np.asarray(x)
+    x = np.asarray(x, dtype=float)
     pmm = np.ones_like(x)
     if m > 0:
         somx2 = np.sqrt(np.maximum(1.0 - x * x, 0.0))
         fact = 1.0
         for _ in range(1, m + 1):
-            pmm *= -fact * somx2
+            pmm = pmm * (-fact * somx2)
             fact += 2.0
     if l == m:
         return pmm
     pmmp1 = x * (2 * m + 1) * pmm
     if l == m + 1:
         return pmmp1
+    p_lm2, p_lm1 = pmm, pmmp1
     pll = np.zeros_like(x)
-    p_lm2 = pmm
-    p_lm1 = pmmp1
     for ll in range(m + 2, l + 1):
         pll = ((2 * ll - 1) * x * p_lm1 - (ll + m - 1) * p_lm2) / (ll - m)
         p_lm2, p_lm1 = p_lm1, pll
@@ -1860,17 +1423,12 @@ def associated_legendre(l: int, m: int, x: Array) -> Array:
 
 
 def real_spherical_harmonic(l: int, m: int, x: Array, y: Array, z: Array) -> Array:
-    """
-    Real, unnormalized spherical harmonic Y_l^m on the unit sphere.
-
-    This avoids a scipy dependency.  Normalization is irrelevant for
-    convergence tests because the error is relative.
-    """
+    """Real, unnormalized spherical harmonic ``Y_l^m`` evaluated on the unit sphere."""
     phi = np.arctan2(y, x)
-    P = associated_legendre(l, abs(m), np.clip(z, -1.0, 1.0))
+    Plm = associated_legendre(l, abs(m), np.clip(z, -1.0, 1.0))
     if m >= 0:
-        return P * np.cos(m * phi)
-    return P * np.sin(abs(m) * phi)
+        return Plm * np.cos(m * phi)
+    return Plm * np.sin(abs(m) * phi)
 
 
 def solve_laplace_beltrami_sphere(
@@ -1880,51 +1438,31 @@ def solve_laplace_beltrami_sphere(
     c: float = 0.0,
     rankdef: bool = True,
 ) -> SurfaceFunction:
-    """
-    Solve Delta_Gamma u + c u = f on S^2.
+    """Solve ``Delta_Gamma u + c u = f`` on the unit sphere.
 
-    For c=0 this is rank deficient; use a mean-zero RHS and rankdef=True.
+    For ``c = 0`` the problem is rank deficient; use a mean-zero right-hand
+    side and ``rankdef=True``.
     """
     dom = f.domain if isinstance(f, SurfaceFunction) else SurfaceMesh.sphere(n, nref)
-    L = SurfaceOp(dom, {"lap": 1.0, "c": c}, f)
-    L.rankdef = rankdef
+    L = SurfaceOp(dom, {"lap": 1.0, "c": c}, f, rankdef=rankdef)
     u = L.solve()
     return u.remove_mean() if rankdef and c == 0.0 else u
 
 
-def write_vtu(filename: str, u: SurfaceFunction, point_name: str = "u") -> None:
+def write_vtu(filename: Any, u: Any, point_name: str = "u", nvis: int | None = None, **kwargs) -> None:
+    """Write a surface field to a ParaView ``.vtu`` file (no third-party dependency).
+
+    Accepts quadrilateral or triangular scalar or vector fields.  ``nvis``
+    resamples each patch for smoother visualization.  See
+    :func:`pysurfacefun.vtk.write_vtu_fields` for all options.
     """
-    Write a VTU file with triangulated patch grids.
+    from .vtk import write_vtu_fields
 
-    Requires meshio.  Install with: pip install meshio
-    """
-    import meshio
+    write_vtu_fields(filename, {point_name: u}, nvis=nvis, **kwargs)
 
-    points = []
-    values = []
-    faces = []
-    offset = 0
-    n = u.domain.n
-    for x, y, z, val in zip(u.domain.x, u.domain.y, u.domain.z, u.vals):
-        pts = np.column_stack((x.ravel(order="F"), y.ravel(order="F"), z.ravel(order="F")))
-        points.append(pts)
-        values.append(val.ravel(order="F"))
-        for j in range(n - 1):
-            for i in range(n - 1):
-                a = offset + i + j * n
-                b = offset + (i + 1) + j * n
-                c = offset + i + (j + 1) * n
-                d = offset + (i + 1) + (j + 1) * n
-                faces.append([a, b, d])
-                faces.append([a, d, c])
-        offset += n * n
 
-    meshio.write_points_cells(
-        filename,
-        np.vstack(points),
-        [("triangle", np.asarray(faces, dtype=int))],
-        point_data={point_name: np.concatenate(values)},
-    )
+def _patch_values_for_plot(u: Any) -> list[Array]:
+    return [np.real(v) if np.iscomplexobj(v) else v for v in u.vals]
 
 
 def plot_surface(
@@ -1933,27 +1471,34 @@ def plot_surface(
     vmin: float | None = None,
     vmax: float | None = None,
     colorbar: bool = True,
-) -> None:
-    """Basic Matplotlib visualization of the patch values."""
+    cmap: str = "turbo",
+    ax=None,
+    show: bool = True,
+):
+    """Matplotlib visualization of a quadrilateral surface function.
+
+    Returns ``(fig, ax)``.  Complex fields are plotted by their real part.
+    """
     import matplotlib.pyplot as plt
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import Normalize
 
-    fig = plt.figure(figsize=(7, 6))
-    ax = fig.add_subplot(111, projection="3d")
-    plot_vals = [np.real(v) if np.iscomplexobj(v) else v for v in u.vals]
-    if vmin is None:
-        vmin = min(float(np.min(v)) for v in plot_vals)
-    if vmax is None:
-        vmax = max(float(np.max(v)) for v in plot_vals)
+    if ax is None:
+        fig = plt.figure(figsize=(7, 6))
+        ax = fig.add_subplot(111, projection="3d")
+    else:
+        fig = ax.figure
+    plot_vals = _patch_values_for_plot(u)
+    vmin = float(np.min(plot_vals)) if vmin is None else vmin
+    vmax = float(np.max(plot_vals)) if vmax is None else vmax
     norm_obj = Normalize(vmin=vmin, vmax=vmax)
-
+    colormap = plt.get_cmap(cmap)
     for x, y, z, val in zip(u.domain.x, u.domain.y, u.domain.z, plot_vals):
         ax.plot_surface(
             x,
             y,
             z,
-            facecolors=plt.cm.turbo(norm_obj(val)),
+            facecolors=colormap(norm_obj(val)),
             linewidth=0.15,
             edgecolor=(0, 0, 0, 0.25),
             antialiased=True,
@@ -1963,26 +1508,35 @@ def plot_surface(
     ax.set_axis_off()
     ax.set_box_aspect((1, 1, 1))
     if colorbar:
-        mappable = ScalarMappable(norm=norm_obj, cmap=plt.cm.turbo)
+        mappable = ScalarMappable(norm=norm_obj, cmap=colormap)
         mappable.set_array([])
         fig.colorbar(mappable, ax=ax, shrink=0.75, pad=0.02)
-    plt.show()
+    if show:
+        plt.show()
+    return fig, ax
 
 
-def plot_vector_field(f: SurfaceVectorFunction, title: str = "", stride: int = 2, scale: float = 0.6) -> None:
-    """Plot vector magnitude on the surface with sparse 3D quiver arrows."""
+def plot_vector_field(
+    f: SurfaceVectorFunction,
+    title: str = "",
+    stride: int = 2,
+    scale: float = 0.6,
+    ax=None,
+    show: bool = True,
+):
+    """Plot the vector magnitude with sparse 3D quiver arrows.  Returns ``(fig, ax)``."""
     import matplotlib.pyplot as plt
 
     mag = vector_norm(f)
-    fig = plt.figure(figsize=(7, 6))
-    ax = fig.add_subplot(111, projection="3d")
-    vmin = min(float(np.min(v)) for v in mag.vals)
-    vmax = max(float(np.max(v)) for v in mag.vals)
-
+    if ax is None:
+        fig = plt.figure(figsize=(7, 6))
+        ax = fig.add_subplot(111, projection="3d")
+    else:
+        fig = ax.figure
+    vmin = float(np.min(mag.data))
+    vmax = float(np.max(mag.data))
     fx, fy, fz = f.components
-    for x, y, z, mval, vx, vy, vz in zip(
-        f.domain.x, f.domain.y, f.domain.z, mag.vals, fx.vals, fy.vals, fz.vals
-    ):
+    for x, y, z, mval, vx, vy, vz in zip(f.domain.x, f.domain.y, f.domain.z, mag.vals, fx.vals, fy.vals, fz.vals):
         ax.plot_surface(
             x,
             y,
@@ -1994,54 +1548,28 @@ def plot_vector_field(f: SurfaceVectorFunction, title: str = "", stride: int = 2
             shade=False,
         )
         sl = (slice(None, None, stride), slice(None, None, stride))
-        ax.quiver(
-            x[sl],
-            y[sl],
-            z[sl],
-            vx[sl],
-            vy[sl],
-            vz[sl],
-            length=scale,
-            normalize=True,
-            color="k",
-            linewidth=0.45,
-        )
-
+        ax.quiver(x[sl], y[sl], z[sl], vx[sl], vy[sl], vz[sl], length=scale, normalize=True, color="k", linewidth=0.45)
     ax.set_title(title)
     ax.set_axis_off()
     ax.set_box_aspect((1, 1, 1))
-    plt.show()
+    if show:
+        plt.show()
+    return fig, ax
 
 
 def demo_laplace_beltrami_sphere() -> None:
-    """Solve a small Laplace-Beltrami problem on the unit sphere."""
-    l = 3
-    m = 2
-    n = 7
-    nref = 0
-
-    dom = SurfaceMesh.sphere(n, nref)
+    """Solve a small Laplace--Beltrami problem on the unit sphere."""
+    l, m, n = 3, 2, 7
+    dom = SurfaceMesh.sphere(n, 0)
     exact = SurfaceFunction.from_callable(dom, lambda x, y, z: real_spherical_harmonic(l, m, x, y, z))
-    rhs = -l * (l + 1) * exact
-
-    L = SurfaceOp(dom, {"lap": 1.0}, rhs)
-    L.rankdef = True
+    L = SurfaceOp(dom, {"lap": 1.0}, -l * (l + 1) * exact, rankdef=True)
     uh = L.solve().remove_mean()
-
     relerr = (uh - exact.remove_mean()).norm_inf() / exact.norm_inf()
     print(f"relative L_inf error = {relerr:.3e}")
 
-    try:
-        write_vtu("laplace_beltrami_sphere.vtu", uh)
-        print("wrote laplace_beltrami_sphere.vtu")
-    except ImportError:
-        print("VTU skipped: install meshio to export ParaView files")
 
-    try:
-        plot_surface(uh, "Laplace-Beltrami on S^2")
-    except ImportError:
-        print("plot skipped: install matplotlib to plot")
-
+# Names re-exported for code that imported the solver internals from this module.
+_LEGACY_HPS_NAMES = (Leaf, Parent, Patch, merge_patches)
 
 if __name__ == "__main__":
     demo_laplace_beltrami_sphere()

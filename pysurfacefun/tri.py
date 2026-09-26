@@ -47,7 +47,13 @@ Array = np.ndarray
 
 
 def shifted_lobatto_nodes(degree: int) -> Array:
-    """Shifted Lobatto-Gauss-Legendre nodes on ``[0, 1]``."""
+    """Shifted Lobatto-Gauss-Legendre nodes on ``[0, 1]``.
+
+    The interior nodes are the roots of ``P'_degree``, i.e. the Gauss-Jacobi nodes for the
+    weight ``1 - x**2``, computed as eigenvalues of the symmetric Jacobi matrix (Golub-Welsch).
+    Unlike companion-matrix roots they are real by construction (``np.linalg.eigvals`` returns
+    complex arrays from NumPy 2.5 on) and accurate to rounding for any degree.
+    """
     if degree < 0:
         raise ValueError("degree must be nonnegative")
     if degree == 0:
@@ -55,8 +61,10 @@ def shifted_lobatto_nodes(degree: int) -> Array:
     if degree == 1:
         return np.array([0.0, 1.0])
 
-    poly = np.polynomial.legendre.Legendre.basis(degree)
-    roots = np.sort(poly.deriv().roots())
+    k = np.arange(1.0, degree - 1)
+    beta = np.sqrt(k * (k + 2) / ((2 * k + 1) * (2 * k + 3)))
+    roots = np.linalg.eigvalsh(np.diag(beta, -1) + np.diag(beta, 1))
+    roots = 0.5 * (roots - roots[::-1])  # exactly symmetric about 0
     nodes = np.concatenate(([-1.0], roots, [1.0]))
     return 0.5 * (nodes + 1.0)
 

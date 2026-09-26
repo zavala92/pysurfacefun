@@ -1065,10 +1065,14 @@ class HPSSolver:
         if squeeze:
             F = F[:, :, None]
         compiled = self._compiled
+        if bc is not None and compiled.root_b == 0:
+            bc = None  # closed surface: no boundary data
         if bc is not None:
             bc = np.asarray(bc).reshape(compiled.root_b, -1)
             if bc.shape[1] == 1 and F.shape[2] > 1:
                 bc = np.repeat(bc, F.shape[2], axis=1)
+            if np.iscomplexobj(bc) and not np.iscomplexobj(F):
+                F = F.astype(np.result_type(F, bc))
 
         if np.issubdtype(compiled.dtype, np.complexfloating):
             U = compiled.solve(np.ascontiguousarray(F, dtype=np.result_type(F, compiled.dtype)), bc)

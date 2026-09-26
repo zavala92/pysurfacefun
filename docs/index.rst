@@ -13,6 +13,9 @@ and time-dependent surface dynamics.
 
    installation
    quickstart
+   equations
+   timestepping
+   solver
    examples
    api
    references
@@ -20,9 +23,14 @@ and time-dependent surface dynamics.
 Highlights
 ----------
 
-* High-order quadrilateral and triangular surface patches
-* Unified ``field``, ``lap``, ``grad``, ``integral``, and ``norm`` dispatch
-* ``SurfaceProblem`` and ``SurfaceLBVP`` for elliptic solves
-* ``SurfaceIVP`` for implicit reaction-diffusion stepping
-* Evaluator output handlers for repeatable examples and notebooks
-* VTU/VTP output for ParaView
+* High-order quadrilateral (Chebyshev) and triangular (PKD) surface patches
+* Hierarchical Poincaré--Steklov fast direct solver with nested-dissection
+  merge ordering and compiled, batched repeated solves
+* Constant, variable, and complex coefficients; divergence-form equations such
+  as ``-div(k*grad(u)) + u = f`` written as strings
+* IMEX time stepping (SBDF1--4, CNAB1--2, RK111/222/443) for coupled
+  reaction--diffusion systems, reusing one factorization per operator
+* Level-set surfaces from coarse triangular or quadrilateral meshes, open
+  surfaces with Dirichlet data, and degenerate patches
+* Dependency-free VTU/VTP output for ParaView and evaluator output handlers
+  for repeatable runs

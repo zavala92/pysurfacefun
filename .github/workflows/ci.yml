@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint and format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff
+      - run: ruff check pysurfacefun tests examples benchmarks docs/conf.py
+      - run: ruff format --check pysurfacefun tests examples benchmarks docs/conf.py
+
+  tests:
+    name: Tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[test]" pytest-cov
+      - name: Run tests
+        run: python -m pytest --cov --cov-report=term --cov-report=xml
+      - name: Minimal install (NumPy only) still imports and solves
+        if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
+        run: |
+          python -m venv /tmp/minimal
+          /tmp/minimal/bin/python -m pip install .
+          /tmp/minimal/bin/python -c "import pysurfacefun as psf; dom = psf.sphere(7, 1); u = psf.surfaceop(dom, {'lap': -1.0, 'c': 1.0}, 1.0).solve(); print(psf.norm(u - 1.0, 'inf'))"
+
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[test]"
+      - name: Run examples
+        working-directory: ${{ runner.temp }}
+        env:
+          MPLBACKEND: Agg
+        run: |
+          for script in laplace_beltrami_sphere convergence_laplace_beltrami_sphere torus_helmholtz_consistency \
+                        tri_layer2_icosphere_laplace_identity tri_levelset_surface variable_coefficient_elliptic \
+                        reaction_diffusion_system; do
+            echo "::group::$script"
+            python "$GITHUB_WORKSPACE/examples/$script.py"
+            echo "::endgroup::"
+          done
+      - name: Benchmark (smoke)
+        run: python benchmarks/benchmark_solver.py --quick
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r docs/requirements.txt -e .
+      - run: sphinx-build -W --keep-going -b html docs docs/_build/html

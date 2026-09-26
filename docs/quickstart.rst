@@ -1,7 +1,7 @@
 Quick Start
 ===========
 
-Create a high-order quadrilateral sphere and check a Laplace-Beltrami identity:
+Create a high-order quadrilateral sphere and check a Laplace--Beltrami identity:
 
 .. code-block:: python
 
@@ -27,7 +27,16 @@ Solve a shifted surface Helmholtz problem:
    relerr = psf.norm(uh - u, "inf") / psf.norm(u, "inf")
    print(relerr)
 
-Triangular patches use the same style of interface:
+Variable coefficients in divergence form (see :doc:`equations`):
+
+.. code-block:: python
+
+   k = psf.field(lambda x, y, z: 1 + 0.5*x, dom)
+   problem = psf.SurfaceProblem(dom, variables="u", namespace={"k": k, "f": rhs})
+   problem.add_equation("-div(k*grad(u)) + u = f")
+   w = problem.solve()
+
+Triangular patches use the same interface:
 
 .. code-block:: python
 
@@ -36,6 +45,24 @@ Triangular patches use the same style of interface:
 
    print(psf.integral(psf.field(1.0, dom)))
    print(psf.norm(psf.lap(u) + 12*u, "inf"))
+
+Reuse a factorization for many right-hand sides:
+
+.. code-block:: python
+
+   L = psf.surfaceop(dom, {"lap": -1.0, "c": 4.0})
+   u1 = L.solve(psf.field(lambda x, y, z: x, dom))
+   u2 = L.solve(psf.field(lambda x, y, z: y * z, dom))
+
+Coupled reaction--diffusion with a third-order IMEX scheme (see
+:doc:`timestepping`):
+
+.. code-block:: python
+
+   ivp = psf.SurfaceIVP(dom, variables={"u": u0, "v": v0}, namespace={"Du": 1e-3, "Dv": 5e-3})
+   ivp.add_equation("dt(u) - Du*lap(u) = u - u**3 - v")
+   ivp.add_equation("dt(v) - Dv*lap(v) = 0.1*(u - v)")
+   state = ivp.build_solver(dt=0.05, scheme="rk443").run(100)
 
 Repeatable output for examples and notebooks:
 
@@ -53,13 +80,3 @@ Repeatable output for examples and notebooks:
    evaluator.add_task("linf_residual", lambda state: psf.norm(psf.lap(state["u"]) + 12*state["u"], "inf"))
    evaluator.add_task("u", lambda state: state["u"], every=10)
    evaluator.evaluate(0, state={"u": u})
-
-Implicit reaction-diffusion time stepping:
-
-.. code-block:: python
-
-   def reaction(u, t):
-       return u - 2.0*u**3
-
-   solver = psf.SurfaceIVP(u, diffusion=1e-3, reaction=reaction).build_solver(dt=0.05).build()
-   u = solver.run(20)

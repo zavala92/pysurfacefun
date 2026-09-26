@@ -107,8 +107,14 @@ def test_dirichlet_data_on_open_surface_reproduces_harmonic_polynomial():
         ys.append(Y)
         zs.append(0 * X)
     flat = psf.SurfaceMesh(xs, ys, zs)
-    u = psf.surfaceop(flat, {"lap": 1.0}, 0.0).solve(bc=g)
-    assert _relerr(u, psf.field(g, flat)) < 1e-12
+    L = psf.surfaceop(flat, {"lap": 1.0}, 0.0)
+    assert _relerr(L.solve(bc=g), psf.field(g, flat)) < 1e-12
+    # complex boundary data with a real right-hand side keeps its imaginary part
+    gc = lambda x, y, z: (1 + 2j) * g(x, y, z) + 1j * x
+    assert _relerr(L.solve(bc=gc), psf.field(gc, flat)) < 1e-12
+    # boundary data is ignored on closed surfaces
+    closed = psf.surfaceop(psf.sphere(5, 0), {"lap": -1.0, "c": 1.0}, 1.0)
+    assert psf.norm(closed.solve(bc=np.ones(3)) - 1.0, "inf") < 1e-10
 
 
 def test_singular_quadrilateral_patch_is_exact_for_polynomials():

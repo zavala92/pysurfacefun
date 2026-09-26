@@ -291,9 +291,9 @@ class HPSOperator:
         self.build()
         F = self._rhs_values(self.rhs)
         bc_values = None
-        if bc is not None:
-            root = self.solver.root
-            assert root is not None
+        root = self.solver.root
+        assert root is not None
+        if bc is not None and root.nboundary:
             if callable(bc):
                 bc_values = np.asarray(bc(root.xyz[:, 0], root.xyz[:, 1], root.xyz[:, 2]))
             else:

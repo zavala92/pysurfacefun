@@ -1,32 +1,106 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pysurfacefun"
-version = "0.1.0"
-description = "High-order patch-based solvers for variable-coefficient elliptic PDEs on surfaces."
+dynamic = ["version"]
+description = "High-order fast direct solvers for PDEs on surfaces with quadrilateral and triangular patches."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
-dependencies = ["numpy"]
+dependencies = ["numpy>=1.24"]
 authors = [{ name = "Gentian Zavalani" }]
+keywords = [
+    "surface PDE",
+    "spectral methods",
+    "fast direct solver",
+    "hierarchical Poincare-Steklov",
+    "Laplace-Beltrami",
+    "reaction-diffusion",
+]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
-plot = ["matplotlib"]
+plot = ["matplotlib>=3.6"]
 mat = ["scipy", "h5py"]
 io = ["meshio", "scipy", "h5py"]
-docs = ["sphinx"]
-dev = ["pytest", "matplotlib", "meshio", "scipy", "h5py"]
+docs = ["sphinx>=7"]
+test = ["pytest>=7", "meshio"]
+dev = ["pytest>=7", "pytest-cov", "ruff>=0.6", "matplotlib>=3.6", "meshio", "scipy", "h5py", "sphinx>=7"]
 
 [project.urls]
+Homepage = "https://github.com/zavala92/pysurfacefun"
+Documentation = "https://pysurfacefun.readthedocs.io/en/latest/"
+Source = "https://github.com/zavala92/pysurfacefun"
+Issues = "https://github.com/zavala92/pysurfacefun/issues"
+Changelog = "https://github.com/zavala92/pysurfacefun/blob/main/CHANGELOG.md"
 Quadrilateral-reference = "https://github.com/danfortunato/surfacefun"
 Triangular-method-paper = "https://arxiv.org/pdf/2604.03097"
 
+[tool.setuptools.dynamic]
+version = { attr = "pysurfacefun.__version__" }
+
 [tool.setuptools.packages.find]
 include = ["pysurfacefun*"]
+
+[tool.setuptools.package-data]
+pysurfacefun = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+
+[tool.coverage.run]
+source = ["pysurfacefun"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if __name__ == .__main__.:", "raise NotImplementedError"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["notebooks", "docs/_build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "NPY", "C4", "SIM", "RUF"]
+ignore = [
+    "E501",    # long lines are allowed where splitting hurts readability of formulas
+    "E731",    # lambdas for short mathematical functions
+    "E741",    # l, m are standard spherical-harmonic indices
+    "B905",    # zip() without strict= (Python 3.10 compatible code)
+    "SIM108",  # ternaries are not always clearer
+    "RUF001",  # math symbols in strings
+    "RUF002",  # math symbols in docstrings
+    "RUF003",  # math symbols in comments
+    "RUF012",  # mutable class attributes in simple containers
+    "RUF022",  # __all__ is grouped by topic, not sorted
+    "NPY002",  # legacy RNG calls in examples
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B018"]
+"examples/*" = ["E402"]
+"benchmarks/*" = ["E402"]
+"docs/conf.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pysurfacefun"]

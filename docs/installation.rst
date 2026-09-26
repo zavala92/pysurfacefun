@@ -1,30 +1,40 @@
 Installation
 ============
 
-Install the package in editable mode from the Python package directory:
+``pysurfacefun`` requires Python 3.10 or newer and depends only on NumPy.
+Install it in editable mode from a clone of the repository:
 
 .. code-block:: bash
 
+   git clone https://github.com/zavala92/pysurfacefun
    cd pysurfacefun
    python -m pip install -e .
 
-For notebooks, plotting, tests, mesh import, and ParaView export:
+Optional extras:
+
+============  =================================================================
+extra         enables
+============  =================================================================
+``plot``      Matplotlib plotting (``plot_surface``, ``wireframe``, ...)
+``mat``       MAT-file mesh loading via SciPy/h5py (a NumPy-only reader for
+              simple v5 files is built in)
+``io``        ``meshio`` conversions (VTU/VTP output itself needs no extras)
+``test``      the test suite
+``docs``      this documentation
+``dev``       everything above plus ``ruff`` and coverage
+============  =================================================================
 
 .. code-block:: bash
 
    python -m pip install -e ".[dev]"
-
-The core package depends only on NumPy. Optional dependencies are used for
-MAT-file mesh loading, VTU export, plotting, and tests.
+   python -m pytest
 
 Build the documentation
 -----------------------
 
-Install Sphinx and build the HTML documentation:
-
 .. code-block:: bash
 
-   python -m pip install sphinx
+   python -m pip install -e ".[docs]"
    sphinx-build -b html docs docs/_build/html
 
 The generated site will be available in ``docs/_build/html/index.html``.

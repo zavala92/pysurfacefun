@@ -12,6 +12,25 @@ describing the tasks and generated files.
 The script ``examples/evaluator_outputs.py`` is a compact template for this
 pattern.
 
+Example scripts
+---------------
+
+The ``examples/`` directory contains standalone scripts, runnable from a clone
+of the repository:
+
+* ``laplace_beltrami_sphere.py`` and ``convergence_laplace_beltrami_sphere.py``
+  -- manufactured Laplace--Beltrami problems and spectral convergence.
+* ``variable_coefficient_elliptic.py`` -- ``-div(k*grad(u)) + u = f`` on
+  quadrilateral and triangular spheres.
+* ``reaction_diffusion_system.py`` -- a coupled two-field system; compares the
+  accuracy of the IMEX schemes at a fixed step size.
+* ``cow_reaction_diffusion_reduced.py`` -- complex Ginzburg--Landau on the
+  imported cow surface (``--scheme`` selects the time stepper).
+* ``tri_layer1_nodes_basis.py`` to ``tri_layer4_surfaceproblem_helmholtz.py``
+  -- the triangular discretization layer by layer.
+* ``tri_levelset_surface.py`` -- building a surface from a coarse mesh and a
+  level-set function.
+
 Triangular Laplace-Beltrami on the sphere
 -----------------------------------------
 

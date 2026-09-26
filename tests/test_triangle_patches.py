@@ -158,10 +158,7 @@ def test_levelset_surface_tri_projects_nodes_to_sphere():
     grad_phi = lambda p: np.array([2.0 * p[0], 2.0 * p[1], 2.0 * p[2]])
     dom = psf.levelset_surface_tri(vertices, faces, phi, grad_phi, n=6)
 
-    residual = max(
-        np.max(np.abs(x * x + y * y + z * z - 1.0))
-        for x, y, z in zip(dom.x, dom.y, dom.z)
-    )
+    residual = max(np.max(np.abs(x * x + y * y + z * z - 1.0)) for x, y, z in zip(dom.x, dom.y, dom.z))
     assert residual < 1e-12
 
 
@@ -231,10 +228,7 @@ def test_levelset_surface_dispatches_triangle_and_quad_meshes():
     )
     quad_dom = psf.LevelSetSurface((quad_vertices, np.array([[0, 1, 2, 3]])), phi, grad_phi, n=5)
     assert isinstance(quad_dom, psf.SurfaceMesh)
-    residual = max(
-        np.max(np.abs(x * x + y * y + z * z - 1.0))
-        for x, y, z in zip(quad_dom.x, quad_dom.y, quad_dom.z)
-    )
+    residual = max(np.max(np.abs(x * x + y * y + z * z - 1.0)) for x, y, z in zip(quad_dom.x, quad_dom.y, quad_dom.z))
     assert residual < 1e-12
 
 
@@ -250,7 +244,7 @@ def test_refine_surface_mesh_before_levelset_projection():
         ]
     )
     tri_faces = np.array([[0, 1, 2]])
-    verts_ref, faces_ref = psf.refine_surface_mesh(tri_vertices, tri_faces, nref=2)
+    _verts_ref, faces_ref = psf.refine_surface_mesh(tri_vertices, tri_faces, nref=2)
     assert faces_ref.shape == (16, 3)
 
     tri_dom = psf.LevelSetSurface((tri_vertices, tri_faces), phi, grad_phi, n=4, nref=2)
@@ -266,7 +260,7 @@ def test_refine_surface_mesh_before_levelset_projection():
         ]
     )
     quad_cells = np.array([[0, 1, 2, 3]])
-    verts_ref, cells_ref = psf.refine_surface_mesh(quad_vertices, quad_cells, nref=1)
+    _verts_ref, cells_ref = psf.refine_surface_mesh(quad_vertices, quad_cells, nref=1)
     assert cells_ref.shape == (4, 4)
 
     quad_dom = psf.LevelSetSurface((quad_vertices, quad_cells), phi, grad_phi, n=4, nref=1)

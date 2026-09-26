@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -34,10 +34,7 @@ def main() -> None:
         area_error = abs(psf.integral(psf.field(1.0, dom)) - exact_area)
         lap_error = psf.norm(residual, "inf")
         rows.append((dom.degree, n, dom.npatches, area_error, lap_error))
-        print(
-            f"degree={dom.degree:2d}, n={n:2d}, "
-            f"area error={area_error:.3e}, lap identity error={lap_error:.3e}"
-        )
+        print(f"degree={dom.degree:2d}, n={n:2d}, area error={area_error:.3e}, lap identity error={lap_error:.3e}")
 
     data = np.asarray(rows)
     header = "degree n npatches area_error lap_identity_error"

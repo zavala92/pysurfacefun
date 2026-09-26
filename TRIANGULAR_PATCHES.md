@@ -25,7 +25,7 @@ https://arxiv.org/pdf/2604.03097
 python examples/tri_layer1_nodes_basis.py --n 8 --plot
 python examples/tri_layer2_icosphere_laplace_identity.py --n 9 --nref 1 --plot
 python examples/tri_layer3_prefinement_convergence.py --n-values "5 7 9 11" --nref 1 --plot
-python examples/tri_layer4_surfaceop_helmholtz.py --n-values "5 7 9 11" --nref 0 --plot
+python examples/tri_layer4_surfaceproblem_helmholtz.py --n-values "5 7 9 11" --nref 0 --plot
 ```
 
 ## Level-Set Surfaces

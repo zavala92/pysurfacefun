@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import inspect
 import json
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from numbers import Number
 from pathlib import Path
-import re
-from typing import Any, Callable, Mapping
+from typing import Any
 
 import numpy as np
 
-from .core import SurfaceFunction, SurfaceVectorFunction, write_vtu
-from .tri import TriangleSurfaceFunction, TriangleSurfaceVectorFunction, write_tri_vtu
-
+from .core import SurfaceFunction, SurfaceVectorFunction
+from .fields import PatchField, PatchVectorField
+from .tri import TriangleSurfaceFunction, TriangleSurfaceVectorFunction
+from .vtk import write_vtu_fields
 
 State = Mapping[str, Any]
 TaskCallback = Callable[[State], Any] | Callable[[], Any]
@@ -95,7 +97,7 @@ class EvaluationRecord:
 class OutputHandler:
     """Base class for evaluator output handlers."""
 
-    def write(self, evaluator: "Evaluator", record: EvaluationRecord) -> list[dict[str, Any]]:
+    def write(self, evaluator: Evaluator, record: EvaluationRecord) -> list[dict[str, Any]]:
         raise NotImplementedError
 
 
@@ -107,7 +109,7 @@ class JSONLinesOutputHandler(OutputHandler):
         self.append = append
         self._written_paths: set[Path] = set()
 
-    def write(self, evaluator: "Evaluator", record: EvaluationRecord) -> list[dict[str, Any]]:
+    def write(self, evaluator: Evaluator, record: EvaluationRecord) -> list[dict[str, Any]]:
         values = {}
         for name, value in record.values.items():
             json_value = _json_ready(value)
@@ -142,7 +144,7 @@ class NPZOutputHandler(OutputHandler):
         self.include_geometry = include_geometry
         self.compressed = compressed
 
-    def write(self, evaluator: "Evaluator", record: EvaluationRecord) -> list[dict[str, Any]]:
+    def write(self, evaluator: Evaluator, record: EvaluationRecord) -> list[dict[str, Any]]:
         files: list[dict[str, Any]] = []
         for name, value in record.values.items():
             arrays = self._arrays_for(value)
@@ -161,7 +163,7 @@ class NPZOutputHandler(OutputHandler):
         return files
 
     def _arrays_for(self, value: Any) -> dict[str, np.ndarray]:
-        if isinstance(value, (SurfaceFunction, TriangleSurfaceFunction)):
+        if isinstance(value, PatchField):
             arrays = {
                 "kind": np.asarray(type(value).__name__),
                 "npatches": np.asarray(value.domain.npatches),
@@ -173,7 +175,7 @@ class NPZOutputHandler(OutputHandler):
                 arrays.update(_patch_arrays("z", value.domain.z))
             return arrays
 
-        if isinstance(value, (SurfaceVectorFunction, TriangleSurfaceVectorFunction)):
+        if isinstance(value, PatchVectorField):
             arrays = {
                 "kind": np.asarray(type(value).__name__),
                 "npatches": np.asarray(value.domain.npatches),
@@ -193,7 +195,14 @@ class NPZOutputHandler(OutputHandler):
 
 
 class VTKOutputHandler(OutputHandler):
-    """Write scalar or vector field snapshots as VTU files."""
+    """Write scalar or vector field snapshots as ParaView ``.vtu`` files.
+
+    Each field is written to its own file; vector fields become a single
+    three-component point array.  Quadrilateral and triangular fields are both
+    supported and ``nvis`` resamples them for smoother visualization.  No
+    third-party packages are required (``skip_missing_meshio`` is accepted for
+    backward compatibility and ignored).
+    """
 
     def __init__(
         self,
@@ -202,58 +211,31 @@ class VTKOutputHandler(OutputHandler):
         point_name: str | None = None,
         nvis: int | None = None,
         skip_missing_meshio: bool = False,
+        binary: bool = True,
+        compress: bool = True,
     ):
         self.directory = directory
         self.filename_template = filename_template
         self.point_name = point_name
         self.nvis = nvis
         self.skip_missing_meshio = skip_missing_meshio
+        self.binary = binary
+        self.compress = compress
 
-    def write(self, evaluator: "Evaluator", record: EvaluationRecord) -> list[dict[str, Any]]:
+    def write(self, evaluator: Evaluator, record: EvaluationRecord) -> list[dict[str, Any]]:
         files: list[dict[str, Any]] = []
         for name, value in record.values.items():
-            if isinstance(value, (SurfaceFunction, TriangleSurfaceFunction)):
-                files.extend(self._write_scalar(evaluator, record.iteration, name, value))
-            elif isinstance(value, (SurfaceVectorFunction, TriangleSurfaceVectorFunction)):
-                for suffix, component in zip(("x", "y", "z"), value.components):
-                    files.extend(self._write_scalar(evaluator, record.iteration, f"{name}_{suffix}", component))
+            if isinstance(value, (PatchField, PatchVectorField)):
+                files.append(self._write_field(evaluator, record.iteration, name, value))
         return files
 
-    def _write_scalar(
-        self,
-        evaluator: "Evaluator",
-        iteration: int,
-        name: str,
-        value: SurfaceValue,
-    ) -> list[dict[str, Any]]:
-        filename = self.filename_template.format(
-            prefix=evaluator.prefix,
-            name=_safe_name(name),
-            iteration=iteration,
-        )
+    def _write_field(self, evaluator: Evaluator, iteration: int, name: str, value: Any) -> dict[str, Any]:
+        filename = self.filename_template.format(prefix=evaluator.prefix, name=_safe_name(name), iteration=iteration)
         path = evaluator.output_dir / self.directory / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         point_name = self.point_name or _safe_name(name)
-
-        if isinstance(value, TriangleSurfaceFunction):
-            write_tri_vtu(str(path), value, point_name=point_name, nvis=self.nvis)
-        else:
-            try:
-                write_vtu(str(path), value, point_name=point_name)
-            except ImportError:
-                if not self.skip_missing_meshio:
-                    raise
-                return [
-                    {
-                        "kind": "vtu",
-                        "path": evaluator.relative_path(path),
-                        "task": name,
-                        "status": "skipped",
-                        "reason": "meshio is not installed",
-                    }
-                ]
-
-        return [{"kind": "vtu", "path": evaluator.relative_path(path), "task": name}]
+        write_vtu_fields(path, {point_name: value}, nvis=self.nvis, binary=self.binary, compress=self.compress)
+        return {"kind": "vtu", "path": evaluator.relative_path(path), "task": name}
 
 
 class Evaluator:
@@ -297,11 +279,7 @@ class Evaluator:
         """Evaluate ready tasks, run output handlers, and refresh the manifest."""
         state = {} if state is None else state
         iteration = int(iteration)
-        values = {
-            task.name: task.evaluate(state)
-            for task in self.tasks
-            if task.ready(iteration, force=force)
-        }
+        values = {task.name: task.evaluate(state) for task in self.tasks if task.ready(iteration, force=force)}
         record = EvaluationRecord(iteration=iteration, time=time, values=values)
         for handler in self.handlers:
             record.files.extend(handler.write(self, record))

@@ -1,7 +1,7 @@
 """p-refinement convergence check for the sphere Laplace--Beltrami solver."""
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -40,7 +40,7 @@ def main() -> None:
     )
 
     for n, err in zip(ns, errors):
-        print(f"n = {n:2d}, p = {n-1:2d}, relative L_inf error = {err:.3e}")
+        print(f"n = {n:2d}, p = {n - 1:2d}, relative L_inf error = {err:.3e}")
 
     try:
         import matplotlib.pyplot as plt

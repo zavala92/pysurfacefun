@@ -8,9 +8,9 @@ matches the color pattern typically shown for this example.
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
-import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

@@ -106,8 +106,8 @@ Compared with version 0.1.0 (4-core machine, OpenBLAS):
 |---|---:|---:|---:|
 | cow (Rhino), n = 12 | 339 | 2.20 s → 0.15 s | 28 ms → 5.0 ms |
 | torus 16 × 32, n = 9 | 512 | 1.05 s → 0.17 s | 39 ms → 2.8 ms |
-| triangular level-set sphere, n = 9 | 416 | 0.28 s → 0.15 s | 29 ms → 1.7 ms |
-| Swiss-cheese level set, n = 10 | 616 | 0.36 s → 0.23 s | 29 ms → 3.0 ms |
+| triangular sphere, n = 9 | 416 | 0.28 s → 0.15 s | 29 ms → 1.7 ms |
+| Swiss-cheese set, n = 10 | 616 | 0.36 s → 0.23 s | 29 ms → 3.0 ms |
 
 Nested dissection shrinks the largest interface system on the cow mesh from
 1820 to about 200 unknowns. The 2000-step cow and Swiss-cheese notebooks now
